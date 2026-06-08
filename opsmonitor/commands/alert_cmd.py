@@ -88,7 +88,7 @@ def handle_alert(ctx, alert_id, note, handler, conclusion, recovery_time, config
     quiet = ctx.obj.get("quiet", False)
     formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
-    success = cm.mark_alert_handled(
+    success, msg = cm.mark_alert_handled(
         alert_id=alert_id,
         note=note,
         handler=handler,
@@ -97,14 +97,14 @@ def handle_alert(ctx, alert_id, note, handler, conclusion, recovery_time, config
     )
 
     if success:
-        msg = f"✅ 告警 {alert_id} 已标记为已处理"
+        success_msg = f"✅ 告警 {alert_id} 已标记为已处理"
         if handler and not quiet:
-            msg += f"（处理人: {handler}）"
+            success_msg += f"（处理人: {handler}）"
         if conclusion and not quiet:
-            msg += f"（结论: {conclusion}）"
-        click.echo(formatter._colorize(msg, "\033[92m"))
+            success_msg += f"（结论: {conclusion}）"
+        click.echo(formatter._colorize(success_msg, "\033[92m"))
     else:
-        raise ValidationError(f"告警 {alert_id} 不存在")
+        raise ValidationError(msg or f"告警 {alert_id} 不存在")
 
 
 @alert.command("handle-target")
@@ -124,7 +124,7 @@ def handle_target(ctx, target_name, note, handler, conclusion, recovery_time, co
     quiet = ctx.obj.get("quiet", False)
     formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
-    count = cm.mark_target_alerts_handled(
+    count, msg = cm.mark_target_alerts_handled(
         target_name=target_name,
         note=note,
         handler=handler,
@@ -133,12 +133,14 @@ def handle_target(ctx, target_name, note, handler, conclusion, recovery_time, co
     )
 
     if count > 0:
-        msg = f"✅ 目标 '{target_name}' 的 {count} 条告警已标记为已处理"
+        success_msg = f"✅ 目标 '{target_name}' 的 {count} 条告警已标记为已处理"
         if handler and not quiet:
-            msg += f"（处理人: {handler}）"
+            success_msg += f"（处理人: {handler}）"
         if conclusion and not quiet:
-            msg += f"（结论: {conclusion}）"
-        click.echo(formatter._colorize(msg, "\033[92m"))
+            success_msg += f"（结论: {conclusion}）"
+        click.echo(formatter._colorize(success_msg, "\033[92m"))
+    elif msg:
+        raise ValidationError(msg)
     else:
         click.echo(formatter._colorize(f"⚠️  目标 '{target_name}' 没有未处理告警", "\033[93m"))
 
@@ -362,6 +364,40 @@ def list_events(ctx, target, group, only_active, hours, start_time, end_time, li
             f"共 {len(events)} 条事件, 进行中 {active}, 已结束 {closed}",
             "\033[93m"
         ))
+
+
+@alert.command("add-note")
+@click.argument("event_id")
+@click.argument("note")
+@click.option("--author", help="备注人姓名")
+@click.option("--category", type=click.Choice(["排查动作", "工单号", "责任团队", "其他"]), help="备注分类")
+@click.option("--config-dir", type=click.Path(), help="配置目录路径")
+@click.pass_context
+def add_note(ctx, event_id, note, author, category, config_dir):
+    """给持续事件添加值班备注"""
+    from pathlib import Path
+    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
+
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    success, msg = cm.add_event_note(
+        event_id=event_id,
+        note=note,
+        author=author,
+        category=category
+    )
+
+    if success:
+        msg = f"✅ 备注已添加到事件 {event_id}"
+        if author and not quiet:
+            msg += f"（备注人: {author}）"
+        if category and not quiet:
+            msg += f"（分类: {category}）"
+        click.echo(formatter._colorize(msg, "\033[92m"))
+    else:
+        raise ValidationError(msg or f"事件 {event_id} 不存在")
 
 
 @alert.command("set-threshold")

@@ -290,10 +290,12 @@ class OutputFormatter:
         recovery_method_display = f" | 恢复方式: {recovery_method_str}" if closed and recovery_method_str else ""
 
         event_id_short = event.get("id", "")[:8]
+        is_new_round = event.get("is_new_round", False)
+        new_round_str = self._colorize(" [新轮次]", Colors.MAGENTA) if is_new_round else ""
 
         line = (f"{status_icon} [{event_id_short}...] {self._colorize(target.ljust(18), Colors.BOLD)} "
                 f"{level_icon} {alert_count} 条告警 | 开始: {start_time} | 最后更新: {last_update}"
-                f"{duration_str}{recovery_method_display} | {status_text}")
+                f"{duration_str}{recovery_method_display}{new_round_str} | {status_text}")
 
         if self.verbose:
             lines = [line]
@@ -339,6 +341,13 @@ class OutputFormatter:
                         handler = entry.get("handler", "")
                         conclusion = entry.get("conclusion", "")
                         lines.append(f"      ➜ {entry_ts} 结束: {method_display} - {handler} - {conclusion}")
+                    elif entry_type == "note":
+                        note = entry.get("note", "")
+                        author = entry.get("author", "")
+                        category = entry.get("category", "")
+                        category_str = f" [{category}]" if category else ""
+                        author_str = f" ({author})" if author else ""
+                        lines.append(f"      ✏️ {entry_ts} 备注{category_str}{author_str}: {note}")
             return "\n".join(lines)
 
         return line

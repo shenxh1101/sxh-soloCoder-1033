@@ -346,16 +346,25 @@ class ConfigManager:
 
     def mark_alert_handled(self, alert_id: str, note: str = "",
                            handler: str = "", conclusion: str = "",
-                           recovery_time = None) -> bool:
+                           recovery_time = None) -> Tuple[bool, str]:
         alerts = self._load_json(self.alerts_file) or []
         if isinstance(recovery_time, str):
             try:
                 dt = datetime.strptime(recovery_time, "%Y-%m-%d %H:%M:%S")
                 recovery_time = int(dt.timestamp())
             except ValueError:
-                recovery_time = int(time.time())
+                return False, "恢复时间格式错误，应为 YYYY-MM-DD HH:MM:SS"
+
         for alert in alerts:
             if alert.get("id") == alert_id:
+                event_id = alert.get("event_id")
+                if event_id:
+                    success, msg = self._close_event(
+                        event_id, note, handler, conclusion, recovery_time, recovery_method="manual"
+                    )
+                    if not success:
+                        return False, msg
+
                 alert["handled"] = True
                 alert["handled_note"] = note
                 alert["handled_at"] = int(time.time())
@@ -364,26 +373,35 @@ class ConfigManager:
                 alert["recovery_time"] = recovery_time or int(time.time())
                 self._save_json(self.alerts_file, alerts)
 
-                event_id = alert.get("event_id")
-                if event_id:
-                    self._close_event(event_id, note, handler, conclusion, recovery_time, recovery_method="manual")
-
-                return True
-        return False
+                return True, ""
+        return False, "告警不存在"
 
     def mark_target_alerts_handled(self, target_name: str, note: str = "",
                                    handler: str = "", conclusion: str = "",
-                                   recovery_time = None) -> int:
+                                   recovery_time = None) -> Tuple[int, str]:
         alerts = self._load_json(self.alerts_file) or []
         if isinstance(recovery_time, str):
             try:
                 dt = datetime.strptime(recovery_time, "%Y-%m-%d %H:%M:%S")
                 recovery_time = int(dt.timestamp())
             except ValueError:
-                recovery_time = int(time.time())
+                return 0, "恢复时间格式错误，应为 YYYY-MM-DD HH:MM:SS"
+
         count = 0
         now = int(time.time())
         event_ids = set()
+        for alert in alerts:
+            if alert.get("target") == target_name and not alert.get("handled", False):
+                if alert.get("event_id"):
+                    event_ids.add(alert["event_id"])
+
+        for event_id in event_ids:
+            success, msg = self._close_event(
+                event_id, note, handler, conclusion, recovery_time, recovery_method="manual"
+            )
+            if not success:
+                return 0, msg
+
         for alert in alerts:
             if alert.get("target") == target_name and not alert.get("handled", False):
                 alert["handled"] = True
@@ -393,14 +411,9 @@ class ConfigManager:
                 alert["conclusion"] = conclusion
                 alert["recovery_time"] = recovery_time or now
                 count += 1
-                if alert.get("event_id"):
-                    event_ids.add(alert["event_id"])
         self._save_json(self.alerts_file, alerts)
 
-        for event_id in event_ids:
-            self._close_event(event_id, note, handler, conclusion, recovery_time, recovery_method="manual")
-
-        return count
+        return count, ""
 
     def get_active_event(self, target: str) -> Optional[Dict]:
         state = self.load_state()
@@ -455,6 +468,16 @@ class ConfigManager:
                     self._save_json(self.events_file, events)
                     return event
 
+        target_events = [e for e in events if e.get("target") == target]
+        target_events.sort(key=lambda x: x.get("start_time", 0), reverse=True)
+        is_new_round = False
+        previous_event_id = None
+        if target_events:
+            last_event = target_events[0]
+            if last_event.get("closed", False) and last_event.get("recovery_method") == "manual":
+                is_new_round = True
+                previous_event_id = last_event.get("id")
+
         import uuid
         event_id = str(uuid.uuid4())
         start_time = first_alert.get("timestamp", now)
@@ -483,12 +506,15 @@ class ConfigManager:
             "close_conclusion": None,
             "recovery_time": None,
             "duration_seconds": None,
+            "is_new_round": is_new_round,
+            "previous_event_id": previous_event_id,
             "timeline": [{
                 "type": "start",
                 "timestamp": start_time,
                 "level": level,
                 "message": message,
-                "response_time": response_time
+                "response_time": response_time,
+                "is_new_round": is_new_round
             }]
         }
         events.append(event)
@@ -501,18 +527,12 @@ class ConfigManager:
 
     def _close_event(self, event_id: str, note: str = "", handler: str = "",
                      conclusion: str = "", recovery_time: Optional[int] = None,
-                     recovery_method: str = "manual") -> bool:
+                     recovery_method: str = "manual") -> Tuple[bool, str]:
         events = self._load_json(self.events_file) or []
         now = int(time.time())
         for event in events:
             if event.get("id") == event_id and not event.get("closed", False):
-                event["closed"] = True
-                event["close_time"] = now
-                event["close_note"] = note
-                event["close_handler"] = handler
-                event["close_conclusion"] = conclusion
-                event["recovery_time"] = recovery_time or now
-                event["recovery_method"] = recovery_method
+                rt = recovery_time or now
                 start_time = event["start_time"]
                 if isinstance(start_time, str):
                     try:
@@ -520,7 +540,18 @@ class ConfigManager:
                         start_time = int(dt.timestamp())
                     except ValueError:
                         start_time = now
-                event["duration_seconds"] = event["recovery_time"] - start_time
+
+                if rt < start_time:
+                    return False, "恢复时间不能早于事件开始时间"
+
+                event["closed"] = True
+                event["close_time"] = now
+                event["close_note"] = note
+                event["close_handler"] = handler
+                event["close_conclusion"] = conclusion
+                event["recovery_time"] = rt
+                event["recovery_method"] = recovery_method
+                event["duration_seconds"] = rt - start_time
 
                 if "timeline" not in event:
                     event["timeline"] = [{
@@ -532,7 +563,7 @@ class ConfigManager:
                     }]
                 event["timeline"].append({
                     "type": "recovery",
-                    "timestamp": event["recovery_time"],
+                    "timestamp": rt,
                     "method": recovery_method,
                     "handler": handler,
                     "conclusion": conclusion,
@@ -546,15 +577,16 @@ class ConfigManager:
                 if state["active_events"].get(target) == event_id:
                     del state["active_events"][target]
                 self.save_state(state)
-                return True
-        return False
+                return True, ""
+        return False, "事件不存在或已关闭"
 
     def get_events(self, target: Optional[str] = None,
                    group: Optional[str] = None,
                    only_active: bool = False,
                    start_time: Optional[datetime] = None,
                    end_time: Optional[datetime] = None,
-                   limit: int = 100) -> List[Dict]:
+                   limit: int = 100,
+                   impact_window: bool = False) -> List[Dict]:
         events = self._load_json(self.events_file) or []
         if target:
             events = [e for e in events if e.get("target") == target]
@@ -562,12 +594,31 @@ class ConfigManager:
             events = [e for e in events if self.get_target_group(e.get("target", "")) == group]
         if only_active:
             events = [e for e in events if not e.get("closed", False)]
-        if start_time:
-            start_ts = int(start_time.timestamp())
-            events = [e for e in events if self._timestamp_to_int(e.get("start_time", 0)) >= start_ts]
-        if end_time:
-            end_ts = int(end_time.timestamp())
-            events = [e for e in events if self._timestamp_to_int(e.get("start_time", 0)) <= end_ts]
+        if start_time or end_time:
+            if impact_window:
+                start_ts = int(start_time.timestamp()) if start_time else 0
+                end_ts = int(end_time.timestamp()) if end_time else int(time.time())
+                filtered = []
+                for event in events:
+                    event_start = self._timestamp_to_int(event.get("start_time", 0))
+                    event_end = self._timestamp_to_int(event.get("recovery_time", event.get("close_time", int(time.time()))))
+                    if event.get("closed", False):
+                        if event.get("recovery_time"):
+                            event_end = self._timestamp_to_int(event["recovery_time"])
+                        elif event.get("close_time"):
+                            event_end = self._timestamp_to_int(event["close_time"])
+                    else:
+                        event_end = int(time.time())
+                    if event_start <= end_ts and event_end >= start_ts:
+                        filtered.append(event)
+                events = filtered
+            else:
+                if start_time:
+                    start_ts = int(start_time.timestamp())
+                    events = [e for e in events if self._timestamp_to_int(e.get("start_time", 0)) >= start_ts]
+                if end_time:
+                    end_ts = int(end_time.timestamp())
+                    events = [e for e in events if self._timestamp_to_int(e.get("start_time", 0)) <= end_ts]
         events.sort(key=lambda x: x.get("start_time", 0), reverse=True)
         return events[:limit]
 
@@ -589,7 +640,7 @@ class ConfigManager:
             return None
 
         event_id = active_event["id"]
-        self._close_event(
+        success, msg = self._close_event(
             event_id,
             note="自动恢复",
             handler="system",
@@ -597,6 +648,8 @@ class ConfigManager:
             recovery_time=recovery_time,
             recovery_method="auto"
         )
+        if not success:
+            return None
 
         alerts = self._load_json(self.alerts_file) or []
         for alert in alerts:
@@ -612,3 +665,29 @@ class ConfigManager:
         self._save_json(self.alerts_file, alerts)
 
         return active_event
+
+    def add_event_note(self, event_id: str, note: str, author: str = "",
+                       category: str = "") -> Tuple[bool, str]:
+        events = self._load_json(self.events_file) or []
+        now = int(time.time())
+        for event in events:
+            if event.get("id") == event_id:
+                if "timeline" not in event:
+                    event["timeline"] = [{
+                        "type": "start",
+                        "timestamp": event.get("start_time", now),
+                        "level": event.get("first_level", ""),
+                        "message": event.get("first_message", ""),
+                        "response_time": 0
+                    }]
+                event["timeline"].append({
+                    "type": "note",
+                    "timestamp": now,
+                    "note": note,
+                    "author": author,
+                    "category": category
+                })
+                event["last_update"] = now
+                self._save_json(self.events_file, events)
+                return True, ""
+        return False, "事件不存在"

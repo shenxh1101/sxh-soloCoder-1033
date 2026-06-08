@@ -1,5 +1,6 @@
 import json
 import csv
+from collections import Counter
 from datetime import datetime, timedelta
 from io import StringIO
 import click
@@ -442,6 +443,7 @@ def timeline(ctx, target, group, hours, only_active, config_dir):
 
     end_time = datetime.now()
     start_time = end_time - timedelta(hours=hours)
+    now_ts = int(end_time.timestamp())
 
     events = cm.get_events(
         target=target,
@@ -449,7 +451,8 @@ def timeline(ctx, target, group, hours, only_active, config_dir):
         only_active=only_active,
         start_time=start_time,
         end_time=end_time,
-        limit=100
+        limit=100,
+        impact_window=True
     )
 
     if not events:
@@ -465,10 +468,27 @@ def timeline(ctx, target, group, hours, only_active, config_dir):
         if only_active:
             filters.append("仅进行中")
         filter_str = f" (筛选: {', '.join(filters)})" if filters else ""
-        click.echo(formatter._colorize(f"⏱️  故障时间线 ({hours}小时内){filter_str}:", "\033[94m"))
-        click.echo("-" * 100)
+        click.echo(formatter._colorize(f"⏱️  故障时间线 ({hours}小时内) - 按影响窗口{filter_str}:", "\033[94m"))
+        click.echo("-" * 110)
+
+    def _get_real_duration(event):
+        if event.get("closed", False) and event.get("duration_seconds"):
+            return event.get("duration_seconds", 0)
+        start_ts = formatter._timestamp_to_int(event.get("start_time", 0))
+        return now_ts - start_ts
 
     sorted_events = sorted(events, key=lambda e: e.get("start_time", 0))
+
+    target_failure_counts = Counter()
+    group_failure_counts = Counter()
+    for event in events:
+        target_name = event.get("target", "")
+        target_failure_counts[target_name] += 1
+        event_group = cm.get_target_group(target_name)
+        group_failure_counts[event_group] += 1
+
+    worst_targets = target_failure_counts.most_common(5)
+    worst_groups = group_failure_counts.most_common(5)
 
     for event in sorted_events:
         target_name = event.get("target", "")
@@ -479,19 +499,18 @@ def timeline(ctx, target, group, hours, only_active, config_dir):
         has_critical = event.get("has_critical", False)
         highest_level = "critical" if has_critical else event.get("last_level", "warning")
         recovery_method = event.get("recovery_method", "")
-        duration = event.get("duration_seconds")
+        duration = _get_real_duration(event)
 
         status_icon = "🔒" if closed else "🔥"
         level_color = Colors.level_color(highest_level)
         level_icon = formatter._colorize(Colors.status_icon(highest_level), level_color)
 
-        if duration:
-            duration_str = format_duration(duration)
+        if event.get("closed", False) and event.get("duration_seconds"):
+            duration_str = format_duration(event.get("duration_seconds", 0))
         elif not closed:
-            start_ts_int = formatter._timestamp_to_int(start_ts)
-            duration_str = format_duration(int(datetime.now().timestamp()) - start_ts_int) + " (进行中)"
+            duration_str = format_duration(duration) + " (进行中)"
         else:
-            duration_str = "未知"
+            duration_str = format_duration(duration)
 
         recovery_method_str = ""
         if recovery_method == "auto":
@@ -499,12 +518,15 @@ def timeline(ctx, target, group, hours, only_active, config_dir):
         elif recovery_method == "manual":
             recovery_method_str = f"手动处理 ({event.get('close_handler', '')})"
 
+        is_new_round = event.get("is_new_round", False)
+        new_round_str = formatter._colorize(" [新轮次]", Colors.MAGENTA) if is_new_round else ""
+
         first_msg = event.get("first_message", "")
         last_msg = event.get("last_message", "")
 
         line = (f"{status_icon} [{start_str}] {formatter._colorize(target_name.ljust(15), Colors.BOLD)} "
                 f"{level_icon} {alert_count:>3}次告警 | 最高{highest_level.upper():>8} | "
-                f"持续 {duration_str:<15}")
+                f"持续 {duration_str:<18}{new_round_str}")
         if closed and recovery_method_str:
             line += f" | {formatter._colorize(recovery_method_str, Colors.GREEN if recovery_method == 'auto' else Colors.CYAN)}"
 
@@ -518,30 +540,51 @@ def timeline(ctx, target, group, hours, only_active, config_dir):
                 click.echo(f"     {first_msg}")
             event_id = event.get("id", "")[:8]
             level_change = f"{event.get('first_level', '').upper()} -> {event.get('last_level', '').upper()}"
-            click.echo(f"     级别变化: {level_change} | 事件ID: {event_id}...")
+            event_group = cm.get_target_group(target_name)
+            click.echo(f"     级别变化: {level_change} | 服务组: {event_group} | 事件ID: {event_id}...")
             click.echo("")
 
     if not quiet:
-        click.echo("-" * 100)
+        click.echo("-" * 110)
 
-        by_duration = sorted(events, key=lambda e: e.get("duration_seconds", 0) if e.get("duration_seconds") else 0, reverse=True)
+        by_duration = sorted(events, key=_get_real_duration, reverse=True)
         by_count = sorted(events, key=lambda e: e.get("alert_count", 0), reverse=True)
         active_events = [e for e in events if not e.get("closed", False)]
 
         click.echo("")
         click.echo(formatter._colorize("📊 故障排行:", Colors.BOLD + Colors.MAGENTA))
 
-        if by_duration and by_duration[0].get("duration_seconds"):
-            click.echo(f"  最长故障: {by_duration[0].get('target', '')} - {format_duration(by_duration[0].get('duration_seconds', 0))}")
+        if by_duration:
+            longest_target = by_duration[0].get("target", "")
+            longest_duration = _get_real_duration(by_duration[0])
+            click.echo(f"  最长故障: {longest_target} - {format_duration(longest_duration)}")
 
         if by_count and by_count[0].get("alert_count", 0) > 1:
             click.echo(f"  最多告警: {by_count[0].get('target', '')} - {by_count[0].get('alert_count', 0)} 次")
 
         if active_events:
             click.echo(formatter._colorize(f"  进行中事件: {len(active_events)} 个", Colors.RED))
-            for ae in active_events:
+            for ae in active_events[:5]:
                 ae_start = formatter._format_time(ae.get("start_time", 0))
-                click.echo(f"    - {ae.get('target', '')} (开始于 {ae_start})")
+                ae_duration = format_duration(_get_real_duration(ae))
+                ae_level = "CRITICAL" if ae.get("has_critical", False) else ae.get("last_level", "WARNING").upper()
+                click.echo(f"    - {ae.get('target', '')} ({ae_level}, 已持续 {ae_duration}, 开始于 {ae_start})")
+
+        if worst_targets and len(worst_targets) > 1 or (worst_targets and worst_targets[0][1] > 1):
+            click.echo("")
+            click.echo("  故障次数最多的目标:")
+            for i, (t, c) in enumerate(worst_targets[:5], 1):
+                rank_color = Colors.RED if i <= 3 else Colors.YELLOW
+                click.echo(f"    {formatter._colorize(f'#{i}', rank_color)} {t.ljust(16)} {c} 次")
+
+        if worst_groups and (len(worst_groups) > 1 or (worst_groups and worst_groups[0][0] != "default")):
+            click.echo("")
+            click.echo("  故障次数最多的服务组:")
+            for i, (g, c) in enumerate(worst_groups[:5], 1):
+                if g == "default" and c == 0:
+                    continue
+                rank_color = Colors.RED if i <= 3 else Colors.YELLOW
+                click.echo(f"    {formatter._colorize(f'#{i}', rank_color)} {g.ljust(16)} {c} 次")
 
     if quiet:
         total_events = len(events)
@@ -549,9 +592,12 @@ def timeline(ctx, target, group, hours, only_active, config_dir):
         active_events = total_events - closed_events
         has_critical_count = sum(1 for e in events if e.get("has_critical", False))
         total_alerts = sum(e.get("alert_count", 0) for e in events)
+        worst_target = worst_targets[0][0] if worst_targets else "-"
+        worst_count = worst_targets[0][1] if worst_targets else 0
         click.echo(formatter._colorize(
             f"共 {total_events} 个事件, 进行中 {active_events}, 已结束 {closed_events}, "
-            f"含严重 {has_critical_count}, 累计告警 {total_alerts} 次",
+            f"含严重 {has_critical_count}, 累计告警 {total_alerts} 次 | "
+            f"故障最多: {worst_target} ({worst_count}次)",
             "\033[93m"
         ))
 
@@ -575,17 +621,29 @@ def handover(ctx, hours, config_dir):
 
     end_time = datetime.now()
     start_time = end_time - timedelta(hours=hours)
+    now_ts = int(end_time.timestamp())
 
     config = cm.load_config()
     all_alerts = cm.get_alerts()
     all_events = cm.get_events(
         start_time=start_time,
         end_time=end_time,
-        limit=100
+        limit=100,
+        impact_window=True
     )
+    all_active_events = cm.get_events(only_active=True, limit=100)
+
+    def _event_priority_key(event):
+        start_ts = formatter._timestamp_to_int(event.get("start_time", 0))
+        duration = now_ts - start_ts
+        level_rank = 0 if event.get("has_critical", False) else 1
+        count = event.get("alert_count", 1)
+        return (-duration, level_rank, -count)
+
+    all_active_events.sort(key=_event_priority_key)
 
     unhandled_alerts = [a for a in all_alerts if not a.get("handled", False)]
-    active_events = [e for e in all_events if not e.get("closed", False)]
+    active_events = all_active_events
     recently_recovered = [e for e in all_events if e.get("closed", False) and e.get("recovery_time") and e.get("recovery_time", 0) >= int(start_time.timestamp())]
 
     target_failure_counts = Counter()
@@ -601,10 +659,31 @@ def handover(ctx, hours, config_dir):
 
     period_str = f"{start_time.strftime('%Y-%m-%d %H:%M:%S')} 至 {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
 
+    def _get_alert_for_event(event):
+        event_id = event.get("id", "")
+        for a in all_alerts:
+            if a.get("event_id") == event_id and not a.get("handled", False):
+                return a
+        return None
+
+    def _get_target_last_alert(target):
+        target_alerts = [a for a in all_alerts if a.get("target") == target]
+        target_alerts.sort(key=lambda x: formatter._timestamp_to_int(x.get("last_timestamp", x.get("timestamp", 0))), reverse=True)
+        return target_alerts[0] if target_alerts else None
+
     if quiet:
+        worst_active = active_events[0] if active_events else None
+        worst_active_str = ""
+        if worst_active:
+            worst_target = worst_active.get("target", "")
+            worst_level = "CRITICAL" if worst_active.get("has_critical", False) else worst_active.get("last_level", "WARNING").upper()
+            start_ts = formatter._timestamp_to_int(worst_active.get("start_time", 0))
+            worst_duration = format_duration(now_ts - start_ts)
+            worst_active_str = f" | 最严重: {worst_target} ({worst_level}, 已持续{worst_duration})"
+
         output = [
             formatter._colorize(f"交接班: {period_str} ({hours}小时)", Colors.BOLD + Colors.BLUE),
-            f"未处理告警: {len(unhandled_alerts)} | 进行中事件: {len(active_events)} | 最近恢复: {len(recently_recovered)}"
+            f"未处理告警: {len(unhandled_alerts)} | 进行中事件: {len(active_events)} | 最近恢复: {len(recently_recovered)}{worst_active_str}"
         ]
         if worst_targets and worst_targets[0][1] > 0:
             output.append(f"故障最多: {worst_targets[0][0]} ({worst_targets[0][1]}次)")
@@ -614,10 +693,57 @@ def handover(ctx, hours, config_dir):
     output = []
 
     output.append("")
-    output.append("=" * 80)
-    output.append(formatter._colorize(f"📋 值班交接摘要", Colors.BOLD + Colors.MAGENTA))
+    output.append("=" * 90)
+    output.append(formatter._colorize(f"📋 值班交接摘要 - 风险总览", Colors.BOLD + Colors.MAGENTA))
     output.append(f"   统计周期: {period_str} ({hours}小时)")
-    output.append("=" * 80)
+    output.append("=" * 90)
+
+    output.append("")
+    output.append(formatter._colorize(f"� 进行中事件 - 按风险排序 ({len(active_events)} 个):", Colors.BOLD + Colors.RED))
+    if active_events:
+        for event in active_events[:10]:
+            target = event.get("target", "")
+            start_str = formatter._format_time(event.get("start_time", 0))
+            count = event.get("alert_count", 1)
+            has_critical = event.get("has_critical", False)
+            level = "CRITICAL" if has_critical else event.get("last_level", "WARNING").upper()
+            level_color = Colors.RED if has_critical else Colors.YELLOW
+            level_str = formatter._colorize(level, level_color)
+            start_ts_int = formatter._timestamp_to_int(event.get("start_time", 0))
+            duration_sec = now_ts - start_ts_int
+            duration = format_duration(duration_sec)
+            duration_warn = " ⚠️" if duration_sec > 3600 else ""
+            group = cm.get_target_group(target)
+            last_alert = _get_target_last_alert(target)
+            last_msg = last_alert.get("last_message", last_alert.get("message", "")) if last_alert else event.get("last_message", "")
+            last_update = formatter._format_time(event.get("last_update", 0))
+            is_new_round = event.get("is_new_round", False)
+            new_round_str = formatter._colorize(" [新轮次]", Colors.MAGENTA) if is_new_round else ""
+
+            output.append(f"   {'─'*86}")
+            output.append(f"   {formatter._colorize('●', level_color)} {formatter._colorize(target.ljust(18), Colors.BOLD)} {level_str:>10} | 服务组: {group}{new_round_str}")
+            output.append(f"      开始时间: {start_str} | 已持续: {formatter._colorize(duration, level_color)}{duration_warn} | 累计告警: {count} 次")
+            output.append(f"      最后更新: {last_update}")
+            output.append(f"      最后告警: {last_msg}")
+            if event.get("timeline") and len(event.get("timeline", [])) > 1:
+                timeline = event.get("timeline", [])
+                last_update_entry = timeline[-1] if timeline else None
+                if last_update_entry and last_update_entry.get("type") in ["level_change", "update"]:
+                    rt = last_update_entry.get("response_time", 0)
+                    entry_level = last_update_entry.get("level", "").upper()
+                    output.append(f"      最近状态: {entry_level} - 响应 {rt:.0f}ms")
+
+            notes = [e for e in event.get("timeline", []) if e.get("type") == "note"]
+            if notes:
+                latest_note = notes[-1]
+                note_author = latest_note.get("author", "")
+                note_text = latest_note.get("note", "")
+                note_category = latest_note.get("category", "")
+                author_str = f" ({note_author})" if note_author else ""
+                category_str = f" [{note_category}]" if note_category else ""
+                output.append(f"      最新备注{category_str}{author_str}: {note_text}")
+    else:
+        output.append(formatter._colorize("   ✅ 无进行中事件", Colors.GREEN))
 
     output.append("")
     output.append(formatter._colorize(f"🔴 未处理告警 ({len(unhandled_alerts)} 条):", Colors.BOLD + Colors.RED))
@@ -626,20 +752,6 @@ def handover(ctx, hours, config_dir):
             output.append(f"   {formatter.format_alert(alert)}")
     else:
         output.append(formatter._colorize("   ✅ 无未处理告警", Colors.GREEN))
-
-    output.append("")
-    output.append(formatter._colorize(f"🔥 进行中事件 ({len(active_events)} 个):", Colors.BOLD + Colors.RED))
-    if active_events:
-        for event in active_events[:10]:
-            target = event.get("target", "")
-            start_str = formatter._format_time(event.get("start_time", 0))
-            count = event.get("alert_count", 1)
-            level = "CRITICAL" if event.get("has_critical", False) else event.get("last_level", "WARNING").upper()
-            start_ts_int = formatter._timestamp_to_int(event.get("start_time", 0))
-            duration = format_duration(int(datetime.now().timestamp()) - start_ts_int)
-            output.append(f"   🔥 {target.ljust(15)} {level:>8} | {count:>2}次告警 | 已持续 {duration} | 开始 {start_str}")
-    else:
-        output.append(formatter._colorize("   ✅ 无进行中事件", Colors.GREEN))
 
     output.append("")
     output.append(formatter._colorize(f"✅ 最近恢复事件 ({len(recently_recovered)} 个):", Colors.BOLD + Colors.GREEN))
@@ -684,8 +796,289 @@ def handover(ctx, hours, config_dir):
             output.append(f"   {formatter.format_event(event)}")
 
     output.append("")
-    output.append("=" * 80)
+    output.append("=" * 90)
     output.append(formatter._colorize(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", Colors.GRAY))
-    output.append("=" * 80)
+    output.append("=" * 90)
 
     click.echo("\n".join(output))
+
+
+@report.command("sla")
+@click.option("--hours", type=int, default=24, help="统计时长（小时，默认24小时）")
+@click.option("--group", help="按服务组筛选")
+@click.option("--output", "-o", type=click.Path(), help="导出到文件")
+@click.option("--format", "fmt", type=click.Choice(["json", "csv"]), default="json", help="导出格式")
+@click.option("--config-dir", type=click.Path(), help="配置目录路径")
+@click.pass_context
+def sla(ctx, hours, group, output, fmt, config_dir):
+    """可靠性摘要 - 统计可用率、故障时长、MTTR、MTBF"""
+    import json
+    import csv
+    from io import StringIO
+    from pathlib import Path
+    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
+
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    if hours <= 0:
+        raise ValidationError("统计时长必须大于 0 小时")
+
+    end_time = datetime.now()
+    start_time = end_time - timedelta(hours=hours)
+    now_ts = int(end_time.timestamp())
+    start_ts = int(start_time.timestamp())
+    total_duration = now_ts - start_ts
+
+    all_targets = cm.load_config()["targets"]
+    if group:
+        target_names = [t for t, cfg in all_targets.items() if cfg.get("group", "default") == group]
+    else:
+        target_names = list(all_targets.keys())
+
+    events = cm.get_events(
+        group=group,
+        start_time=start_time,
+        end_time=end_time,
+        limit=500,
+        impact_window=True
+    )
+
+    def _get_event_outage_duration(event):
+        event_start = formatter._timestamp_to_int(event.get("start_time", 0))
+        if event.get("closed", False) and event.get("recovery_time"):
+            event_end = formatter._timestamp_to_int(event["recovery_time"])
+        elif not event.get("closed", False):
+            event_end = now_ts
+        else:
+            event_end = formatter._timestamp_to_int(event.get("close_time", now_ts))
+        overlap_start = max(event_start, start_ts)
+        overlap_end = min(event_end, now_ts)
+        return max(0, overlap_end - overlap_start)
+
+    target_stats = {}
+    group_stats = {}
+
+    for target_name in target_names:
+        target_cfg = all_targets.get(target_name, {})
+        target_group = target_cfg.get("group", "default")
+        target_events = [e for e in events if e.get("target") == target_name]
+
+        total_outage = sum(_get_event_outage_duration(e) for e in target_events)
+        longest_outage = max(
+            (_get_event_outage_duration(e) for e in target_events),
+            default=0
+        )
+
+        recovered_events = [e for e in target_events if e.get("closed", False) and e.get("recovery_time")]
+        total_recovery_time = sum(e.get("duration_seconds", 0) for e in recovered_events)
+        mttr = total_recovery_time / len(recovered_events) if recovered_events else 0
+        num_failures = len(target_events)
+        uptime = total_duration - total_outage
+        availability = (uptime / total_duration * 100) if total_duration > 0 else 100.0
+        mtbf = (uptime / num_failures) if num_failures > 0 and uptime > 0 else 0
+
+        target_stats[target_name] = {
+            "target": target_name,
+            "group": target_group,
+            "total_duration_seconds": total_duration,
+            "total_outage_seconds": total_outage,
+            "longest_outage_seconds": longest_outage,
+            "uptime_seconds": uptime,
+            "availability_pct": round(availability, 4),
+            "num_failures": num_failures,
+            "num_recovered": len(recovered_events),
+            "mttr_seconds": round(mttr, 2),
+            "mtbf_seconds": round(mtbf, 2)
+        }
+
+        if target_group not in group_stats:
+            group_stats[target_group] = {
+                "group": target_group,
+                "total_duration_seconds": total_duration,
+                "total_outage_seconds": 0,
+                "longest_outage_seconds": 0,
+                "uptime_seconds": 0,
+                "availability_pct": 0,
+                "num_targets": 0,
+                "total_failures": 0,
+                "total_recovered": 0,
+                "total_mttr_seconds": 0,
+                "num_mttr_events": 0,
+                "mttr_seconds": 0,
+                "mtbf_seconds": 0
+            }
+        gs = group_stats[target_group]
+        gs["num_targets"] += 1
+        gs["total_outage_seconds"] += total_outage
+        gs["longest_outage_seconds"] = max(gs["longest_outage_seconds"], longest_outage)
+        gs["total_failures"] += num_failures
+        gs["total_recovered"] += len(recovered_events)
+        gs["total_mttr_seconds"] += total_recovery_time
+        gs["num_mttr_events"] += len(recovered_events)
+
+    for gname, gs in group_stats.items():
+        gs["uptime_seconds"] = gs["total_duration_seconds"] * gs["num_targets"] - gs["total_outage_seconds"]
+        total_uptime_group = gs["total_duration_seconds"] * gs["num_targets"]
+        gs["availability_pct"] = round(
+            (gs["uptime_seconds"] / total_uptime_group * 100) if total_uptime_group > 0 else 100.0,
+            4
+        )
+        gs["mttr_seconds"] = round(
+            gs["total_mttr_seconds"] / gs["num_mttr_events"] if gs["num_mttr_events"] > 0 else 0,
+            2
+        )
+        group_total_uptime = gs["uptime_seconds"]
+        gs["mtbf_seconds"] = round(
+            (group_total_uptime / gs["total_failures"]) if gs["total_failures"] > 0 and group_total_uptime > 0 else 0,
+            2
+        )
+
+    if output:
+        export_data = {
+            "period": {
+                "start_time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "end_time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "hours": hours,
+                "total_duration_seconds": total_duration
+            },
+            "targets": target_stats,
+            "groups": group_stats
+        }
+
+        if fmt == "json":
+            content = json.dumps(export_data, indent=2, ensure_ascii=False)
+        else:
+            output_io = StringIO()
+            writer = csv.writer(output_io)
+            writer.writerow([
+                "类型", "名称", "服务组", "可用率(%)", "总时长(秒)", "故障总时长(秒)",
+                "最长故障(秒)", "故障次数", "恢复次数", "MTTR(秒)", "MTBF(秒)"
+            ])
+            for tname, ts in target_stats.items():
+                writer.writerow([
+                    "目标", tname, ts["group"],
+                    f"{ts['availability_pct']:.4f}",
+                    ts["total_duration_seconds"],
+                    ts["total_outage_seconds"],
+                    ts["longest_outage_seconds"],
+                    ts["num_failures"],
+                    ts["num_recovered"],
+                    ts["mttr_seconds"],
+                    ts["mtbf_seconds"]
+                ])
+            for gname, gs in group_stats.items():
+                writer.writerow([
+                    "服务组", gname, gname,
+                    f"{gs['availability_pct']:.4f}",
+                    gs["total_duration_seconds"] * gs["num_targets"],
+                    gs["total_outage_seconds"],
+                    gs["longest_outage_seconds"],
+                    gs["total_failures"],
+                    gs["total_recovered"],
+                    gs["mttr_seconds"],
+                    gs["mtbf_seconds"]
+                ])
+            content = output_io.getvalue()
+
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(content)
+        click.echo(formatter._colorize(f"✅ 可靠性数据已导出到 {output} ({fmt} 格式)", "\033[92m"))
+        return
+
+    sorted_targets = sorted(
+        target_stats.values(),
+        key=lambda x: (x["availability_pct"], -x["total_outage_seconds"])
+    )
+
+    if quiet:
+        output_lines = [
+            formatter._colorize(f"可靠性摘要 ({hours}小时)", Colors.BOLD + Colors.BLUE),
+        ]
+        worst = sorted_targets[0] if sorted_targets else None
+        if worst:
+            output_lines.append(
+                f"可用率最低: {worst['target']} ({worst['availability_pct']:.2f}%) | "
+                f"故障时长: {format_duration(worst['total_outage_seconds'])}"
+            )
+        if group_stats:
+            worst_group = sorted(group_stats.values(), key=lambda x: x["availability_pct"])[0]
+            output_lines.append(
+                f"组可用率最低: {worst_group['group']} ({worst_group['availability_pct']:.2f}%)"
+            )
+        click.echo("\n".join(output_lines))
+        return
+
+    output_lines = []
+    period_str = f"{start_time.strftime('%Y-%m-%d %H:%M:%S')} 至 {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+
+    output_lines.append("")
+    output_lines.append("=" * 100)
+    output_lines.append(formatter._colorize(f"📊 可靠性摘要", Colors.BOLD + Colors.MAGENTA))
+    output_lines.append(f"   统计周期: {period_str} ({hours}小时)")
+    output_lines.append("=" * 100)
+
+    def _format_stat_row(name, avail, total_outage, longest_outage, num_failures, mttr, mtbf, indent="   "):
+        avail_color = Colors.GREEN if avail >= 99.9 else (Colors.YELLOW if avail >= 99 else Colors.RED)
+        avail_str = formatter._colorize(f"{avail:.4f}%", avail_color)
+
+        parts = [
+            f"{indent}{name.ljust(18)}",
+            f"可用率: {avail_str}",
+            f"故障总时长: {format_duration(total_outage):>12}",
+            f"最长故障: {format_duration(longest_outage):>12}",
+            f"故障次数: {num_failures:>3}"
+        ]
+        if mttr > 0:
+            parts.append(f"MTTR: {format_duration(mttr):>12}")
+        if mtbf > 0:
+            parts.append(f"MTBF: {format_duration(mtbf):>12}")
+        return " | ".join(parts)
+
+    output_lines.append("")
+    output_lines.append(formatter._colorize("🎯 按目标统计:", Colors.BOLD + Colors.CYAN))
+    display_count = 3 if not verbose else len(sorted_targets)
+    for ts in sorted_targets[:display_count]:
+        output_lines.append(_format_stat_row(
+            ts["target"],
+            ts["availability_pct"],
+            ts["total_outage_seconds"],
+            ts["longest_outage_seconds"],
+            ts["num_failures"],
+            ts["mttr_seconds"],
+            ts["mtbf_seconds"]
+        ))
+    if not verbose and len(sorted_targets) > display_count:
+        remaining = len(sorted_targets) - display_count
+        output_lines.append(f"   ... 还有 {remaining} 个目标, 使用 -v 查看全部")
+
+    if verbose:
+        output_lines.append("")
+        output_lines.append(formatter._colorize("📦 按服务组统计:", Colors.BOLD + Colors.CYAN))
+        sorted_groups = sorted(group_stats.values(), key=lambda x: x["availability_pct"])
+        for gs in sorted_groups:
+            output_lines.append(_format_stat_row(
+                gs["group"],
+                gs["availability_pct"],
+                gs["total_outage_seconds"],
+                gs["longest_outage_seconds"],
+                gs["total_failures"],
+                gs["mttr_seconds"],
+                gs["mtbf_seconds"],
+                indent="   "
+            ))
+
+    output_lines.append("")
+    output_lines.append("=" * 100)
+    output_lines.append(formatter._colorize(
+        f"可用率: 正常≥99.9%(绿) | 关注99-99.9%(黄) | 异常<99%(红)",
+        Colors.GRAY
+    ))
+    output_lines.append(formatter._colorize(
+        f"MTTR=平均恢复时间 | MTBF=平均无故障时间",
+        Colors.GRAY
+    ))
+    output_lines.append("=" * 100)
+
+    click.echo("\n".join(output_lines))
