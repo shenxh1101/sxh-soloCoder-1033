@@ -263,6 +263,14 @@ class OutputFormatter:
         has_critical = event.get("has_critical", False)
         closed = event.get("closed", False)
         duration = event.get("duration_seconds")
+        recovery_method = event.get("recovery_method", "")
+
+        if recovery_method == "auto":
+            recovery_method_str = "自动恢复"
+        elif recovery_method == "manual":
+            recovery_method_str = "手动处理"
+        else:
+            recovery_method_str = ""
 
         status_icon = "🔒" if closed else "🔥"
         status_text = self._colorize("已关闭", Colors.GRAY) if closed else self._colorize("进行中", Colors.RED)
@@ -279,11 +287,13 @@ class OutputFormatter:
             current_duration = int(datetime.now().timestamp()) - start_ts
             duration_str = f" | 已持续: {format_duration(current_duration)}"
 
+        recovery_method_display = f" | 恢复方式: {recovery_method_str}" if closed and recovery_method_str else ""
+
         event_id_short = event.get("id", "")[:8]
 
         line = (f"{status_icon} [{event_id_short}...] {self._colorize(target.ljust(18), Colors.BOLD)} "
                 f"{level_icon} {alert_count} 条告警 | 开始: {start_time} | 最后更新: {last_update}"
-                f"{duration_str} | {status_text}")
+                f"{duration_str}{recovery_method_display} | {status_text}")
 
         if self.verbose:
             lines = [line]
@@ -291,10 +301,44 @@ class OutputFormatter:
             lines.append(f"    最后告警: {event.get('last_message', '')}")
             lines.append(f"    级别变化: {first_level.upper()} -> {last_level.upper()}")
             if closed:
-                lines.append(f"    关闭人: {event.get('close_handler', '')}")
-                lines.append(f"    关闭结论: {event.get('close_conclusion', '')}")
-                lines.append(f"    关闭备注: {event.get('close_note', '')}")
-                lines.append(f"    关闭时间: {self._format_time(event.get('close_time', 0))}")
+                recovery_time = event.get("recovery_time")
+                close_time = event.get("close_time")
+                if recovery_time:
+                    lines.append(f"    恢复时间: {self._format_time(recovery_time)}")
+                if close_time:
+                    lines.append(f"    处理时间: {self._format_time(close_time)}")
+                lines.append(f"    处理人: {event.get('close_handler', '')}")
+                lines.append(f"    处理结论: {event.get('close_conclusion', '')}")
+                lines.append(f"    处理备注: {event.get('close_note', '')}")
+                if recovery_method_str:
+                    lines.append(f"    恢复方式: {recovery_method_str}")
+            timeline = event.get("timeline", [])
+            if timeline and len(timeline) > 0:
+                lines.append("")
+                lines.append(self._colorize("    📅 事件时间线:", Colors.BOLD + Colors.CYAN))
+                for entry in timeline:
+                    entry_type = entry.get("type", "")
+                    entry_ts = self._format_time(entry.get("timestamp", 0))
+                    if entry_type == "start":
+                        level = entry.get("level", "")
+                        msg = entry.get("message", "")
+                        lines.append(f"      ➜ {entry_ts} 开始: {level.upper()} - {msg}")
+                    elif entry_type == "level_change":
+                        level = entry.get("level", "")
+                        msg = entry.get("message", "")
+                        rt = entry.get("response_time", 0)
+                        lines.append(f"      ➜ {entry_ts} 级别变化: {level.upper()} - {msg} ({rt:.0f}ms)")
+                    elif entry_type == "update":
+                        level = entry.get("level", "")
+                        msg = entry.get("message", "")
+                        rt = entry.get("response_time", 0)
+                        lines.append(f"      ➜ {entry_ts} 更新: {level.upper()} - {msg} ({rt:.0f}ms)")
+                    elif entry_type == "recovery":
+                        method = entry.get("method", "")
+                        method_display = "自动恢复" if method == "auto" else "手动处理"
+                        handler = entry.get("handler", "")
+                        conclusion = entry.get("conclusion", "")
+                        lines.append(f"      ➜ {entry_ts} 结束: {method_display} - {handler} - {conclusion}")
             return "\n".join(lines)
 
         return line

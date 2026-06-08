@@ -279,10 +279,10 @@ class AlertManager:
             if consecutive >= thresholds.get("consecutive_failures", 3):
                 should_alert = True
                 alert_type = "failure"
-        elif result.state_changed and current_level == "critical":
+        elif current_level == "critical":
             should_alert = True
             alert_type = "slow_critical"
-        elif result.state_changed and current_level == "warning":
+        elif current_level == "warning":
             should_alert = True
             alert_type = "slow_warning"
 
@@ -304,7 +304,7 @@ class AlertManager:
             }
 
             event = self.config_manager.create_or_update_event(
-                target, current_level, message, alert
+                target, current_level, message, alert, result.response_time
             )
             alert["event_id"] = event["id"]
 

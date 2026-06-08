@@ -366,7 +366,7 @@ class ConfigManager:
 
                 event_id = alert.get("event_id")
                 if event_id:
-                    self._close_event(event_id, note, handler, conclusion, recovery_time)
+                    self._close_event(event_id, note, handler, conclusion, recovery_time, recovery_method="manual")
 
                 return True
         return False
@@ -398,7 +398,7 @@ class ConfigManager:
         self._save_json(self.alerts_file, alerts)
 
         for event_id in event_ids:
-            self._close_event(event_id, note, handler, conclusion, recovery_time)
+            self._close_event(event_id, note, handler, conclusion, recovery_time, recovery_method="manual")
 
         return count
 
@@ -417,38 +417,59 @@ class ConfigManager:
         return None
 
     def create_or_update_event(self, target: str, level: str, message: str,
-                               first_alert: Dict) -> Dict:
+                               first_alert: Dict, response_time: float = 0.0) -> Dict:
         state = self.load_state()
         event_id = state["active_events"].get(target)
         events = self._load_json(self.events_file) or []
+        now = int(time.time())
 
         if event_id:
             for event in events:
                 if event.get("id") == event_id and not event.get("closed", False):
-                    event["last_update"] = int(time.time())
+                    event["last_update"] = now
                     event["last_level"] = level
                     event["last_message"] = message
                     event["alert_count"] = event.get("alert_count", 0) + 1
                     if level == "critical":
                         event["has_critical"] = True
+
+                    if "timeline" not in event:
+                        event["timeline"] = [{
+                            "type": "start",
+                            "timestamp": event["start_time"],
+                            "level": event["first_level"],
+                            "message": event["first_message"],
+                            "response_time": first_alert.get("response_time", 0)
+                        }]
+
+                    prev_level = event["timeline"][-1]["level"] if event["timeline"] else event["first_level"]
+                    timeline_entry = {
+                        "type": "level_change" if prev_level != level else "update",
+                        "timestamp": now,
+                        "level": level,
+                        "message": message,
+                        "response_time": response_time
+                    }
+                    event["timeline"].append(timeline_entry)
+
                     self._save_json(self.events_file, events)
                     return event
 
         import uuid
         event_id = str(uuid.uuid4())
-        start_time = first_alert.get("timestamp", int(time.time()))
+        start_time = first_alert.get("timestamp", now)
         if isinstance(start_time, str):
             try:
                 dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
                 start_time = int(dt.timestamp())
             except ValueError:
-                start_time = int(time.time())
+                start_time = now
         event = {
             "id": event_id,
             "target": target,
             "first_alert_id": first_alert.get("id"),
             "start_time": start_time,
-            "last_update": int(time.time()),
+            "last_update": now,
             "first_level": level,
             "last_level": level,
             "first_message": message,
@@ -460,7 +481,15 @@ class ConfigManager:
             "close_note": None,
             "close_handler": None,
             "close_conclusion": None,
-            "duration_seconds": None
+            "recovery_time": None,
+            "duration_seconds": None,
+            "timeline": [{
+                "type": "start",
+                "timestamp": start_time,
+                "level": level,
+                "message": message,
+                "response_time": response_time
+            }]
         }
         events.append(event)
         self._save_json(self.events_file, events)
@@ -471,24 +500,45 @@ class ConfigManager:
         return event
 
     def _close_event(self, event_id: str, note: str = "", handler: str = "",
-                     conclusion: str = "", recovery_time: Optional[int] = None) -> bool:
+                     conclusion: str = "", recovery_time: Optional[int] = None,
+                     recovery_method: str = "manual") -> bool:
         events = self._load_json(self.events_file) or []
+        now = int(time.time())
         for event in events:
             if event.get("id") == event_id and not event.get("closed", False):
                 event["closed"] = True
-                event["close_time"] = int(time.time())
+                event["close_time"] = now
                 event["close_note"] = note
                 event["close_handler"] = handler
                 event["close_conclusion"] = conclusion
-                event["recovery_time"] = recovery_time or int(time.time())
+                event["recovery_time"] = recovery_time or now
+                event["recovery_method"] = recovery_method
                 start_time = event["start_time"]
                 if isinstance(start_time, str):
                     try:
                         dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
                         start_time = int(dt.timestamp())
                     except ValueError:
-                        start_time = int(time.time())
+                        start_time = now
                 event["duration_seconds"] = event["recovery_time"] - start_time
+
+                if "timeline" not in event:
+                    event["timeline"] = [{
+                        "type": "start",
+                        "timestamp": event["start_time"],
+                        "level": event["first_level"],
+                        "message": event["first_message"],
+                        "response_time": 0
+                    }]
+                event["timeline"].append({
+                    "type": "recovery",
+                    "timestamp": event["recovery_time"],
+                    "method": recovery_method,
+                    "handler": handler,
+                    "conclusion": conclusion,
+                    "note": note
+                })
+
                 self._save_json(self.events_file, events)
 
                 state = self.load_state()
@@ -500,13 +550,24 @@ class ConfigManager:
         return False
 
     def get_events(self, target: Optional[str] = None,
+                   group: Optional[str] = None,
                    only_active: bool = False,
-                   limit: int = 50) -> List[Dict]:
+                   start_time: Optional[datetime] = None,
+                   end_time: Optional[datetime] = None,
+                   limit: int = 100) -> List[Dict]:
         events = self._load_json(self.events_file) or []
         if target:
             events = [e for e in events if e.get("target") == target]
+        if group:
+            events = [e for e in events if self.get_target_group(e.get("target", "")) == group]
         if only_active:
             events = [e for e in events if not e.get("closed", False)]
+        if start_time:
+            start_ts = int(start_time.timestamp())
+            events = [e for e in events if self._timestamp_to_int(e.get("start_time", 0)) >= start_ts]
+        if end_time:
+            end_ts = int(end_time.timestamp())
+            events = [e for e in events if self._timestamp_to_int(e.get("start_time", 0)) <= end_ts]
         events.sort(key=lambda x: x.get("start_time", 0), reverse=True)
         return events[:limit]
 
@@ -533,7 +594,8 @@ class ConfigManager:
             note="自动恢复",
             handler="system",
             conclusion="resolved",
-            recovery_time=recovery_time
+            recovery_time=recovery_time,
+            recovery_method="auto"
         )
 
         alerts = self._load_json(self.alerts_file) or []

@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from io import StringIO
 import click
 from opsmonitor.config import ConfigManager, ValidationError
-from opsmonitor.formatter import OutputFormatter, percentile, p95, p99, format_duration
+from opsmonitor.formatter import OutputFormatter, percentile, p95, p99, format_duration, Colors
 
 
 def _calculate_stats(history_entries):
@@ -423,11 +423,13 @@ def export(ctx, hours, output, fmt, config_dir):
 
 @report.command("timeline")
 @click.option("--target", help="按目标筛选")
+@click.option("--group", help="按服务组筛选")
 @click.option("--hours", type=int, default=24, help="统计时长（小时）")
+@click.option("--only-active", is_flag=True, help="仅显示进行中的事件")
 @click.option("--config-dir", type=click.Path(), help="配置目录路径")
 @click.pass_context
-def timeline(ctx, target, hours, config_dir):
-    """生成故障时间线"""
+def timeline(ctx, target, group, hours, only_active, config_dir):
+    """按持续事件生成故障时间线"""
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
 
@@ -441,38 +443,249 @@ def timeline(ctx, target, hours, config_dir):
     end_time = datetime.now()
     start_time = end_time - timedelta(hours=hours)
 
-    alerts = cm.get_alerts(target_name=target)
-    filtered = []
-    for a in alerts:
-        ts = _parse_timestamp(a.get("timestamp"))
-        if ts and start_time <= ts <= end_time:
-            filtered.append(a)
+    events = cm.get_events(
+        target=target,
+        group=group,
+        only_active=only_active,
+        start_time=start_time,
+        end_time=end_time,
+        limit=100
+    )
 
-    if not filtered:
-        click.echo(formatter._colorize("✅ 该时间段内无告警", "\033[92m"))
+    if not events:
+        click.echo(formatter._colorize("✅ 该时间段内无故障事件", "\033[92m"))
         return
 
     if not quiet:
-        click.echo(formatter._colorize(f"⏱️  故障时间线 ({hours}小时内):", "\033[94m"))
+        filters = []
+        if target:
+            filters.append(f"目标={target}")
+        if group:
+            filters.append(f"组={group}")
+        if only_active:
+            filters.append("仅进行中")
+        filter_str = f" (筛选: {', '.join(filters)})" if filters else ""
+        click.echo(formatter._colorize(f"⏱️  故障时间线 ({hours}小时内){filter_str}:", "\033[94m"))
+        click.echo("-" * 100)
 
-    sorted_alerts = sorted(filtered, key=lambda a: a["timestamp"])
+    sorted_events = sorted(events, key=lambda e: e.get("start_time", 0))
 
-    for alert in sorted_alerts:
-        level = alert.get("level", "warning")
-        status_color = "\033[91m" if level == "critical" else "\033[93m"
-        handled = alert.get("handled", False)
-        handled_marker = "[已处理]" if handled else "[未处理]"
+    for event in sorted_events:
+        target_name = event.get("target", "")
+        start_ts = event.get("start_time", 0)
+        start_str = formatter._format_time(start_ts)
+        closed = event.get("closed", False)
+        alert_count = event.get("alert_count", 1)
+        has_critical = event.get("has_critical", False)
+        highest_level = "critical" if has_critical else event.get("last_level", "warning")
+        recovery_method = event.get("recovery_method", "")
+        duration = event.get("duration_seconds")
 
-        line = f"[{alert['timestamp']}] {formatter._colorize(level.upper(), status_color)} {alert['target']}: {alert['message']}"
-        if verbose and not quiet:
-            line += f" {formatter._colorize(handled_marker, '\033[90m')}"
+        status_icon = "🔒" if closed else "🔥"
+        level_color = Colors.level_color(highest_level)
+        level_icon = formatter._colorize(Colors.status_icon(highest_level), level_color)
+
+        if duration:
+            duration_str = format_duration(duration)
+        elif not closed:
+            start_ts_int = formatter._timestamp_to_int(start_ts)
+            duration_str = format_duration(int(datetime.now().timestamp()) - start_ts_int) + " (进行中)"
+        else:
+            duration_str = "未知"
+
+        recovery_method_str = ""
+        if recovery_method == "auto":
+            recovery_method_str = "自动恢复"
+        elif recovery_method == "manual":
+            recovery_method_str = f"手动处理 ({event.get('close_handler', '')})"
+
+        first_msg = event.get("first_message", "")
+        last_msg = event.get("last_message", "")
+
+        line = (f"{status_icon} [{start_str}] {formatter._colorize(target_name.ljust(15), Colors.BOLD)} "
+                f"{level_icon} {alert_count:>3}次告警 | 最高{highest_level.upper():>8} | "
+                f"持续 {duration_str:<15}")
+        if closed and recovery_method_str:
+            line += f" | {formatter._colorize(recovery_method_str, Colors.GREEN if recovery_method == 'auto' else Colors.CYAN)}"
+
         click.echo(line)
 
+        if verbose and not quiet:
+            if first_msg != last_msg:
+                click.echo(f"     首次: {first_msg}")
+                click.echo(f"     最后: {last_msg}")
+            else:
+                click.echo(f"     {first_msg}")
+            event_id = event.get("id", "")[:8]
+            level_change = f"{event.get('first_level', '').upper()} -> {event.get('last_level', '').upper()}"
+            click.echo(f"     级别变化: {level_change} | 事件ID: {event_id}...")
+            click.echo("")
+
+    if not quiet:
+        click.echo("-" * 100)
+
+        by_duration = sorted(events, key=lambda e: e.get("duration_seconds", 0) if e.get("duration_seconds") else 0, reverse=True)
+        by_count = sorted(events, key=lambda e: e.get("alert_count", 0), reverse=True)
+        active_events = [e for e in events if not e.get("closed", False)]
+
+        click.echo("")
+        click.echo(formatter._colorize("📊 故障排行:", Colors.BOLD + Colors.MAGENTA))
+
+        if by_duration and by_duration[0].get("duration_seconds"):
+            click.echo(f"  最长故障: {by_duration[0].get('target', '')} - {format_duration(by_duration[0].get('duration_seconds', 0))}")
+
+        if by_count and by_count[0].get("alert_count", 0) > 1:
+            click.echo(f"  最多告警: {by_count[0].get('target', '')} - {by_count[0].get('alert_count', 0)} 次")
+
+        if active_events:
+            click.echo(formatter._colorize(f"  进行中事件: {len(active_events)} 个", Colors.RED))
+            for ae in active_events:
+                ae_start = formatter._format_time(ae.get("start_time", 0))
+                click.echo(f"    - {ae.get('target', '')} (开始于 {ae_start})")
+
     if quiet:
-        critical_count = sum(1 for a in sorted_alerts if a.get("level") == "critical")
-        warning_count = sum(1 for a in sorted_alerts if a.get("level") == "warning")
-        handled_count = sum(1 for a in sorted_alerts if a.get("handled"))
+        total_events = len(events)
+        closed_events = sum(1 for e in events if e.get("closed", False))
+        active_events = total_events - closed_events
+        has_critical_count = sum(1 for e in events if e.get("has_critical", False))
+        total_alerts = sum(e.get("alert_count", 0) for e in events)
         click.echo(formatter._colorize(
-            f"共 {len(sorted_alerts)} 条告警, 严重 {critical_count}, 警告 {warning_count}, 已处理 {handled_count}",
+            f"共 {total_events} 个事件, 进行中 {active_events}, 已结束 {closed_events}, "
+            f"含严重 {has_critical_count}, 累计告警 {total_alerts} 次",
             "\033[93m"
         ))
+
+
+@report.command("handover")
+@click.option("--hours", type=int, default=8, help="统计时长（小时，默认8小时值班周期）")
+@click.option("--config-dir", type=click.Path(), help="配置目录路径")
+@click.pass_context
+def handover(ctx, hours, config_dir):
+    """值班交接摘要"""
+    from pathlib import Path
+    from collections import Counter
+    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
+
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    if hours <= 0:
+        raise ValidationError("统计时长必须大于 0 小时")
+
+    end_time = datetime.now()
+    start_time = end_time - timedelta(hours=hours)
+
+    config = cm.load_config()
+    all_alerts = cm.get_alerts()
+    all_events = cm.get_events(
+        start_time=start_time,
+        end_time=end_time,
+        limit=100
+    )
+
+    unhandled_alerts = [a for a in all_alerts if not a.get("handled", False)]
+    active_events = [e for e in all_events if not e.get("closed", False)]
+    recently_recovered = [e for e in all_events if e.get("closed", False) and e.get("recovery_time") and e.get("recovery_time", 0) >= int(start_time.timestamp())]
+
+    target_failure_counts = Counter()
+    group_failure_counts = Counter()
+    for event in all_events:
+        target = event.get("target", "")
+        target_failure_counts[target] += 1
+        group = cm.get_target_group(target)
+        group_failure_counts[group] += 1
+
+    worst_targets = target_failure_counts.most_common(5)
+    worst_groups = group_failure_counts.most_common(5)
+
+    period_str = f"{start_time.strftime('%Y-%m-%d %H:%M:%S')} 至 {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+
+    if quiet:
+        output = [
+            formatter._colorize(f"交接班: {period_str} ({hours}小时)", Colors.BOLD + Colors.BLUE),
+            f"未处理告警: {len(unhandled_alerts)} | 进行中事件: {len(active_events)} | 最近恢复: {len(recently_recovered)}"
+        ]
+        if worst_targets and worst_targets[0][1] > 0:
+            output.append(f"故障最多: {worst_targets[0][0]} ({worst_targets[0][1]}次)")
+        click.echo("\n".join(output))
+        return
+
+    output = []
+
+    output.append("")
+    output.append("=" * 80)
+    output.append(formatter._colorize(f"📋 值班交接摘要", Colors.BOLD + Colors.MAGENTA))
+    output.append(f"   统计周期: {period_str} ({hours}小时)")
+    output.append("=" * 80)
+
+    output.append("")
+    output.append(formatter._colorize(f"🔴 未处理告警 ({len(unhandled_alerts)} 条):", Colors.BOLD + Colors.RED))
+    if unhandled_alerts:
+        for alert in unhandled_alerts[:10]:
+            output.append(f"   {formatter.format_alert(alert)}")
+    else:
+        output.append(formatter._colorize("   ✅ 无未处理告警", Colors.GREEN))
+
+    output.append("")
+    output.append(formatter._colorize(f"🔥 进行中事件 ({len(active_events)} 个):", Colors.BOLD + Colors.RED))
+    if active_events:
+        for event in active_events[:10]:
+            target = event.get("target", "")
+            start_str = formatter._format_time(event.get("start_time", 0))
+            count = event.get("alert_count", 1)
+            level = "CRITICAL" if event.get("has_critical", False) else event.get("last_level", "WARNING").upper()
+            start_ts_int = formatter._timestamp_to_int(event.get("start_time", 0))
+            duration = format_duration(int(datetime.now().timestamp()) - start_ts_int)
+            output.append(f"   🔥 {target.ljust(15)} {level:>8} | {count:>2}次告警 | 已持续 {duration} | 开始 {start_str}")
+    else:
+        output.append(formatter._colorize("   ✅ 无进行中事件", Colors.GREEN))
+
+    output.append("")
+    output.append(formatter._colorize(f"✅ 最近恢复事件 ({len(recently_recovered)} 个):", Colors.BOLD + Colors.GREEN))
+    if recently_recovered:
+        for event in recently_recovered[:10]:
+            target = event.get("target", "")
+            recovery_ts = event.get("recovery_time", 0)
+            recovery_str = formatter._format_time(recovery_ts)
+            duration = event.get("duration_seconds", 0)
+            duration_str = format_duration(duration) if duration else "未知"
+            method = event.get("recovery_method", "")
+            method_str = "自动恢复" if method == "auto" else f"手动处理 ({event.get('close_handler', '')})"
+            output.append(f"   ↻ {target.ljust(15)} 恢复于 {recovery_str} | 持续 {duration_str:>12} | {method_str}")
+    else:
+        output.append(formatter._colorize("   无最近恢复事件", Colors.GRAY))
+
+    output.append("")
+    output.append(formatter._colorize("📊 故障统计:", Colors.BOLD + Colors.MAGENTA))
+
+    if worst_targets:
+        output.append("")
+        output.append("   故障次数最多的目标:")
+        for i, (target, count) in enumerate(worst_targets, 1):
+            rank_color = Colors.RED if i <= 3 else (Colors.YELLOW if i <= 5 else Colors.RESET)
+            rank_str = formatter._colorize(f"#{i}", rank_color)
+            output.append(f"      {rank_str} {target.ljust(18)} {count} 次故障")
+
+    if worst_groups and len(worst_groups) > 1 or (worst_groups and worst_groups[0][0] != "default"):
+        output.append("")
+        output.append("   故障次数最多的服务组:")
+        for i, (group, count) in enumerate(worst_groups, 1):
+            if group == "default" and count == 0:
+                continue
+            rank_color = Colors.RED if i <= 3 else (Colors.YELLOW if i <= 5 else Colors.RESET)
+            rank_str = formatter._colorize(f"#{i}", rank_color)
+            output.append(f"      {rank_str} {group.ljust(18)} {count} 次故障")
+
+    if verbose:
+        output.append("")
+        output.append(formatter._colorize("📋 值班期间完整事件列表:", Colors.BOLD + Colors.CYAN))
+        for event in sorted(all_events, key=lambda e: e.get("start_time", 0), reverse=True):
+            output.append(f"   {formatter.format_event(event)}")
+
+    output.append("")
+    output.append("=" * 80)
+    output.append(formatter._colorize(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", Colors.GRAY))
+    output.append("=" * 80)
+
+    click.echo("\n".join(output))
