@@ -7,6 +7,7 @@ from opsmonitor.commands.watch_cmd import watch
 from opsmonitor.commands.alert_cmd import alert
 from opsmonitor.commands.report_cmd import report
 from opsmonitor.formatter import Colors
+from opsmonitor.config import ValidationError
 
 
 @click.group()
@@ -56,6 +57,9 @@ def main():
         click.echo()
         click.echo(f"{Colors.YELLOW}⏹️  操作已取消{Colors.RESET}")
         sys.exit(130)
+    except ValidationError as e:
+        click.echo(f"{Colors.RED}❌ 参数错误: {str(e)}{Colors.RESET}")
+        sys.exit(2)
     except Exception as e:
         click.echo(f"{Colors.RED}❌ 错误: {str(e)}{Colors.RESET}")
         sys.exit(1)

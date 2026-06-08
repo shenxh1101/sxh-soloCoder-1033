@@ -1,5 +1,42 @@
 from datetime import datetime
 from typing import Dict, List, Optional
+import statistics
+
+
+def percentile(data: List[float], p: float) -> float:
+    if not data:
+        return 0.0
+    if len(data) == 1:
+        return data[0]
+    sorted_data = sorted(data)
+    k = (len(sorted_data) - 1) * (p / 100)
+    f = int(k)
+    c = f + 1
+    if c >= len(sorted_data):
+        return sorted_data[-1]
+    return sorted_data[f] + (sorted_data[c] - sorted_data[f]) * (k - f)
+
+
+def p95(data: List[float]) -> float:
+    return percentile(data, 95)
+
+
+def p99(data: List[float]) -> float:
+    return percentile(data, 99)
+
+
+def format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}秒"
+    elif seconds < 3600:
+        return f"{seconds // 60}分{seconds % 60}秒"
+    else:
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        if secs == 0:
+            return f"{hours}小时{minutes}分"
+        return f"{hours}小时{minutes}分{secs}秒"
 
 
 class Colors:
@@ -20,7 +57,8 @@ class Colors:
             "ok": Colors.GREEN,
             "warning": Colors.YELLOW,
             "critical": Colors.RED,
-            "muted": Colors.GRAY
+            "muted": Colors.GRAY,
+            "recovery": Colors.GREEN
         }.get(level, Colors.RESET)
 
     @staticmethod
@@ -29,13 +67,15 @@ class Colors:
             "ok": "✓",
             "warning": "⚠",
             "critical": "✗",
-            "muted": "🔇"
+            "muted": "🔇",
+            "recovery": "↻"
         }.get(level, "•")
 
 
 class OutputFormatter:
-    def __init__(self, verbose: bool = False, use_color: bool = True):
-        self.verbose = verbose
+    def __init__(self, verbose: bool = False, quiet: bool = False, use_color: bool = True):
+        self.verbose = verbose and not quiet
+        self.quiet = quiet
         self.use_color = use_color
 
     def _colorize(self, text: str, color: str) -> str:
@@ -43,8 +83,23 @@ class OutputFormatter:
             return f"{color}{text}{Colors.RESET}"
         return text
 
-    def _format_time(self, timestamp: int) -> str:
+    def _format_time(self, timestamp) -> str:
+        if isinstance(timestamp, str):
+            try:
+                dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return timestamp
         return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _timestamp_to_int(self, timestamp) -> int:
+        if isinstance(timestamp, str):
+            try:
+                dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+                return int(dt.timestamp())
+            except ValueError:
+                return 0
+        return timestamp
 
     def format_check_result(self, result, thresholds: Dict, muted: bool = False) -> str:
         if muted:
@@ -84,6 +139,8 @@ class OutputFormatter:
         return line
 
     def format_group_header(self, group_name: str, count: int) -> str:
+        if self.quiet:
+            return ""
         header = f"\n{'=' * 60}"
         header += f"\n{self._colorize(f'📦 服务组: {group_name} ({count} 个目标)', Colors.BOLD + Colors.BLUE)}"
         header += f"\n{'=' * 60}"
@@ -94,6 +151,24 @@ class OutputFormatter:
         ok_count = sum(1 for r in results if r.success and r.get_level(thresholds) == "ok")
         warning_count = sum(1 for r in results if r.get_level(thresholds) == "warning")
         critical_count = sum(1 for r in results if r.get_level(thresholds) == "critical" or not r.success)
+
+        if self.quiet:
+            lines = [
+                f"检查完成: {total}个目标 | "
+                f"{self._colorize(f'正常{ok_count}', Colors.GREEN)} | "
+                f"{self._colorize(f'警告{warning_count}', Colors.YELLOW)} | "
+                f"{self._colorize(f'严重{critical_count}', Colors.RED)}"
+            ]
+            if total > 0:
+                success_rate = (ok_count + warning_count) / total * 100
+                if success_rate >= 90:
+                    rate_color = Colors.GREEN
+                elif success_rate >= 70:
+                    rate_color = Colors.YELLOW
+                else:
+                    rate_color = Colors.RED
+                lines[0] += f" | 成功率: {self._colorize(f'{success_rate:.1f}%', rate_color)}"
+            return "\n".join(lines)
 
         lines = [
             "",
@@ -125,24 +200,85 @@ class OutputFormatter:
         message = alert.get("message", "")
         alert_id = alert.get("id", "")[:8]
         handled = "✓" if alert.get("handled", False) else " "
+        event_id = alert.get("event_id", "")[:8] if alert.get("event_id") else ""
 
         line = f"{handled} {icon} {level_text} [{time_str}] {target} {message}"
 
+        if self.quiet:
+            return line
+
         if self.verbose:
             lines = [line]
-            lines.append(f"    ID: {alert_id}...  类型: {alert.get('type', '')}")
+            lines.append(f"    ID: {alert_id}...  事件ID: {event_id}...  类型: {alert.get('type', '')}")
             if alert.get("response_time"):
                 lines.append(f"    响应时间: {alert['response_time']:.1f}ms")
             if alert.get("consecutive_failures"):
                 lines.append(f"    连续失败: {alert['consecutive_failures']} 次")
             if alert.get("handled"):
+                handler = alert.get("handler", "")
+                conclusion = alert.get("conclusion", "")
+                recovery_time = alert.get("recovery_time")
+                lines.append(f"    处理人: {handler}")
+                lines.append(f"    处理结论: {conclusion}")
                 lines.append(f"    处理备注: {alert.get('handled_note', '')}")
+                if recovery_time:
+                    lines.append(f"    恢复时间: {self._format_time(recovery_time)}")
                 lines.append(f"    处理时间: {self._format_time(alert.get('handled_at', 0))}")
+            return "\n".join(lines)
+
+        if event_id:
+            line += f" [{event_id}...]"
+        return line
+
+    def format_event(self, event: Dict) -> str:
+        target = event.get("target", "")
+        start_time = self._format_time(event.get("start_time", 0))
+        last_update = self._format_time(event.get("last_update", 0))
+        alert_count = event.get("alert_count", 1)
+        first_level = event.get("first_level", "warning")
+        last_level = event.get("last_level", "warning")
+        has_critical = event.get("has_critical", False)
+        closed = event.get("closed", False)
+        duration = event.get("duration_seconds")
+
+        status_icon = "🔒" if closed else "🔥"
+        status_text = self._colorize("已关闭", Colors.GRAY) if closed else self._colorize("进行中", Colors.RED)
+        level_icon = self._colorize(
+            Colors.status_icon("critical" if has_critical else last_level),
+            Colors.level_color("critical" if has_critical else last_level)
+        )
+
+        duration_str = ""
+        if duration:
+            duration_str = f" | 持续: {format_duration(duration)}"
+        elif not closed:
+            start_ts = self._timestamp_to_int(event.get("start_time", 0))
+            current_duration = int(datetime.now().timestamp()) - start_ts
+            duration_str = f" | 已持续: {format_duration(current_duration)}"
+
+        event_id_short = event.get("id", "")[:8]
+
+        line = (f"{status_icon} [{event_id_short}...] {self._colorize(target.ljust(18), Colors.BOLD)} "
+                f"{level_icon} {alert_count} 条告警 | 开始: {start_time} | 最后更新: {last_update}"
+                f"{duration_str} | {status_text}")
+
+        if self.verbose:
+            lines = [line]
+            lines.append(f"    首次告警: {event.get('first_message', '')}")
+            lines.append(f"    最后告警: {event.get('last_message', '')}")
+            lines.append(f"    级别变化: {first_level.upper()} -> {last_level.upper()}")
+            if closed:
+                lines.append(f"    关闭人: {event.get('close_handler', '')}")
+                lines.append(f"    关闭结论: {event.get('close_conclusion', '')}")
+                lines.append(f"    关闭备注: {event.get('close_note', '')}")
+                lines.append(f"    关闭时间: {self._format_time(event.get('close_time', 0))}")
             return "\n".join(lines)
 
         return line
 
     def format_watch_header(self) -> str:
+        if self.quiet:
+            return ""
         return self._colorize(
             f"{'时间':^19} | {'目标':^15} | {'状态':^8} | {'响应时间':^10} | 消息",
             Colors.BOLD + Colors.CYAN
@@ -169,11 +305,26 @@ class OutputFormatter:
 
         return f"{time_str} | {target} | {level_text} | {time_val} | {msg}"
 
+    def format_recovery(self, recovery_info: Dict) -> str:
+        target = recovery_info.get("target", "")
+        duration = recovery_info.get("duration_seconds", 0)
+        alert_count = recovery_info.get("alert_count", 1)
+        response_time = recovery_info.get("response_time", 0)
+        time_str = self._format_time(recovery_info.get("timestamp", 0))
+
+        icon = self._colorize("↻", Colors.GREEN)
+        return (f"{self._colorize('✅ 服务恢复', Colors.BOLD + Colors.GREEN)} "
+                f"[{time_str}] {self._colorize(target, Colors.BOLD)} "
+                f"已恢复正常 | 响应时间: {response_time:.1f}ms | "
+                f"故障持续: {format_duration(duration)} | 共 {alert_count} 条告警")
+
     def format_muted_target(self, name: str, mute_info: Dict) -> str:
         until = self._format_time(mute_info.get("until", 0))
         reason = mute_info.get("reason", "")
+        remaining = mute_info.get("until", 0) - int(datetime.now().timestamp())
+        remaining_str = format_duration(max(0, remaining)) if remaining > 0 else "已过期"
         icon = self._colorize("🔇", Colors.GRAY)
-        return f"{icon} {self._colorize(name.ljust(20), Colors.BOLD)} 静音至: {until} 原因: {reason}"
+        return f"{icon} {self._colorize(name.ljust(20), Colors.BOLD)} 剩余: {remaining_str} | 静音至: {until} | 原因: {reason}"
 
     def format_target_config(self, name: str, config: Dict) -> str:
         target_type = config.get("type", "http")
@@ -201,6 +352,8 @@ class OutputFormatter:
         return f"[{time_str}] {icon} {level_text} {target}: {message}"
 
     def format_report_section(self, title: str, content: str) -> str:
+        if self.quiet and content.strip():
+            return content
         lines = [
             "",
             "=" * 60,
@@ -208,4 +361,65 @@ class OutputFormatter:
             "=" * 60,
             content
         ]
+        return "\n".join(lines)
+
+    def format_stats(self, label: str, values: List[float], unit: str = "ms") -> str:
+        if not values:
+            return f"  {label.ljust(20)}: 无数据"
+
+        avg = statistics.mean(values)
+        med = statistics.median(values)
+        p95_val = p95(values)
+        p99_val = p99(values)
+        max_val = max(values)
+        min_val = min(values)
+
+        if self.quiet:
+            return (f"  {label}: 平均{avg:.0f}{unit} | P95{p95_val:.0f}{unit} | "
+                    f"P99{p99_val:.0f}{unit} | 最大{max_val:.0f}{unit}")
+
+        return (f"  {label.ljust(20)}: 平均{avg:.0f}{unit} | 中位{med:.0f}{unit} | "
+                f"P95{p95_val:.0f}{unit} | P99{p99_val:.0f}{unit} | "
+                f"最大{max_val:.0f}{unit} | 最小{min_val:.0f}{unit}")
+
+    def format_availability(self, label: str, success_count: int, total_count: int) -> str:
+        if total_count == 0:
+            rate = 0.0
+        else:
+            rate = success_count / total_count * 100
+
+        color = Colors.GREEN if rate >= 99.9 else (Colors.YELLOW if rate >= 99 else Colors.RED)
+        rate_str = self._colorize(f"{rate:.3f}%", color)
+
+        if self.quiet:
+            return f"  {label}: {rate_str}"
+
+        bar_length = 30
+        filled = int(rate / 100 * bar_length)
+        bar = "█" * filled + "░" * (bar_length - filled)
+        return f"  {label.ljust(20)}: {self._colorize(bar, color)} {rate_str} ({success_count}/{total_count})"
+
+    def format_failure_ranking(self, rankings: List[Dict]) -> str:
+        if not rankings:
+            return "  无故障记录"
+
+        lines = []
+        for i, item in enumerate(rankings, 1):
+            target = item.get("target", "")
+            failures = item.get("failures", 0)
+            longest_outage = item.get("longest_outage", 0)
+            total_downtime = item.get("total_downtime", 0)
+
+            rank_color = Colors.RED if i <= 3 else (Colors.YELLOW if i <= 5 else Colors.RESET)
+            rank_str = self._colorize(f"#{i}".ljust(3), rank_color)
+
+            if self.quiet:
+                lines.append(f"  {rank_str} {target.ljust(18)} {failures}次故障 | "
+                            f"累计停机{format_duration(total_downtime)} | "
+                            f"最长{format_duration(longest_outage)}")
+            else:
+                lines.append(f"  {rank_str} {self._colorize(target.ljust(18), Colors.BOLD)} "
+                            f"故障{failures}次 | 累计停机{format_duration(total_downtime)} | "
+                            f"最长单次{format_duration(longest_outage)}")
+
         return "\n".join(lines)

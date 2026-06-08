@@ -1,5 +1,5 @@
 import click
-from opsmonitor.config import ConfigManager
+from opsmonitor.config import ConfigManager, ValidationError
 from opsmonitor.checker import HealthChecker, AlertManager
 from opsmonitor.formatter import OutputFormatter
 
@@ -11,16 +11,19 @@ from opsmonitor.formatter import OutputFormatter
 @click.option("--group-by", "group_by", is_flag=True, default=True, help="按服务分组展示")
 @click.option("--no-group", is_flag=True, help="不按服务分组展示")
 @click.option("--save-history/--no-save-history", default=True, help="保存检查历史")
+@click.option("--show-recovery/--no-show-recovery", default=True, help="显示恢复通知")
+@click.option("--show-alerts/--no-show-alerts", default=True, help="显示新告警")
 @click.option("--config-dir", type=click.Path(), help="配置目录路径")
 @click.pass_context
-def check(ctx, targets, group, check_all, group_by, no_group, save_history, config_dir):
+def check(ctx, targets, group, check_all, group_by, no_group, save_history, show_recovery, show_alerts, config_dir):
     """手动执行连通性检查"""
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
     config = cm.load_config()
 
     verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
     settings = config["settings"]
     thresholds = config["thresholds"]
@@ -46,20 +49,20 @@ def check(ctx, targets, group, check_all, group_by, no_group, save_history, conf
         if group in groups:
             targets_to_check = groups[group]
         else:
-            click.echo(formatter._colorize(f"❌ 服务组 '{group}' 不存在", "\033[91m"))
-            return
+            raise ValidationError(f"服务组 '{group}' 不存在")
     elif check_all:
         for g in groups.values():
             targets_to_check.extend(g)
     else:
-        click.echo(formatter._colorize("⚠️  请指定目标、服务组或使用 --all", "\033[93m"))
-        return
+        raise ValidationError("请指定目标、服务组或使用 --all")
 
     if not targets_to_check:
         click.echo(formatter._colorize("⚠️  没有可检查的目标", "\033[93m"))
         return
 
     results = []
+    new_alerts = []
+    recoveries = []
 
     if no_group:
         for target_name in targets_to_check:
@@ -70,13 +73,21 @@ def check(ctx, targets, group, check_all, group_by, no_group, save_history, conf
             results.append(result)
 
             muted = cm.is_muted(target_name)
-            click.echo(formatter.format_check_result(result, thresholds, muted))
+            if not quiet:
+                click.echo(formatter.format_check_result(result, thresholds, muted))
 
             if save_history:
                 cm.add_history_entry(result.to_dict())
 
             if not muted:
-                alert_manager.check_alert(result, thresholds)
+                alert, event = alert_manager.check_alert(result, thresholds)
+                if alert and show_alerts:
+                    new_alerts.append((alert, event))
+
+                recovery = alert_manager.check_recovery(result, thresholds)
+                if recovery and show_recovery:
+                    recoveries.append(recovery)
+                    cm.clear_active_event(target_name)
     else:
         group_targets = {}
         for target_name in targets_to_check:
@@ -89,18 +100,44 @@ def check(ctx, targets, group, check_all, group_by, no_group, save_history, conf
             group_targets[g].append((target_name, target_config))
 
         for g, items in group_targets.items():
-            click.echo(formatter.format_group_header(g, len(items)))
+            if not quiet:
+                click.echo(formatter.format_group_header(g, len(items)))
             for target_name, target_config in items:
                 result = checker.check(target_config, target_name)
                 results.append(result)
 
                 muted = cm.is_muted(target_name)
-                click.echo(formatter.format_check_result(result, thresholds, muted))
+                if not quiet:
+                    click.echo(formatter.format_check_result(result, thresholds, muted))
 
                 if save_history:
                     cm.add_history_entry(result.to_dict())
 
                 if not muted:
-                    alert_manager.check_alert(result, thresholds)
+                    alert, event = alert_manager.check_alert(result, thresholds)
+                    if alert and show_alerts:
+                        new_alerts.append((alert, event))
+
+                    recovery = alert_manager.check_recovery(result, thresholds)
+                    if recovery and show_recovery:
+                        recoveries.append(recovery)
+                        cm.clear_active_event(target_name)
+
+    if new_alerts:
+        if not quiet:
+            click.echo()
+        for alert, event in new_alerts:
+            if not quiet:
+                click.echo(formatter._colorize("🚨 新告警:", "\033[91m"))
+            click.echo(formatter.format_alert(alert))
+            if event and verbose and not quiet:
+                click.echo(formatter._colorize("  关联事件:", "\033[93m"))
+                click.echo(f"  {formatter.format_event(event)}")
+
+    if recoveries:
+        if not quiet:
+            click.echo()
+        for recovery in recoveries:
+            click.echo(formatter.format_recovery(recovery))
 
     click.echo(formatter.format_summary(results, thresholds))

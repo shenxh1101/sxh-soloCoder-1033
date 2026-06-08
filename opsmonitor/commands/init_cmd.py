@@ -1,5 +1,5 @@
 import click
-from opsmonitor.config import ConfigManager
+from opsmonitor.config import ConfigManager, ValidationError, validate_positive_int
 from opsmonitor.formatter import OutputFormatter
 
 
@@ -21,12 +21,16 @@ def config(ctx, config_dir):
         cm = ConfigManager()
 
     verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
     click.echo(formatter._colorize("✅ 配置已初始化完成", "\033[92m"))
-    click.echo(f"  配置文件: {cm.config_file}")
-    click.echo(f"  历史记录: {cm.history_file}")
-    click.echo(f"  告警记录: {cm.alerts_file}")
+    if not quiet:
+        click.echo(f"  配置文件: {cm.config_file}")
+        click.echo(f"  历史记录: {cm.history_file}")
+        click.echo(f"  告警记录: {cm.alerts_file}")
+        click.echo(f"  状态文件: {cm.state_file}")
+        click.echo(f"  事件文件: {cm.events_file}")
 
     if verbose:
         config = cm.load_config()
@@ -53,11 +57,14 @@ def add_target(ctx, name, target_type, address, port, group, method, expected_st
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
     verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
     if target_type == "tcp" and port is None:
-        click.echo(formatter._colorize("❌ TCP类型必须指定端口", "\033[91m"))
-        return
+        raise ValidationError("TCP类型必须指定端口")
+
+    if port is not None:
+        validate_positive_int(port, "端口")
 
     success = cm.add_target(
         name=name,
@@ -71,11 +78,11 @@ def add_target(ctx, name, target_type, address, port, group, method, expected_st
 
     if success:
         click.echo(formatter._colorize(f"✅ 目标 '{name}' 已添加", "\033[92m"))
-        if verbose:
+        if verbose and not quiet:
             config = cm.load_config()
             click.echo(formatter.format_target_config(name, config["targets"][name]))
     else:
-        click.echo(formatter._colorize(f"❌ 目标 '{name}' 已存在", "\033[91m"))
+        raise ValidationError(f"目标 '{name}' 已存在")
 
 
 @init.command("remove-target")
@@ -87,13 +94,14 @@ def remove_target(ctx, name, config_dir):
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
     verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
     success = cm.remove_target(name)
     if success:
         click.echo(formatter._colorize(f"✅ 目标 '{name}' 已移除", "\033[92m"))
     else:
-        click.echo(formatter._colorize(f"❌ 目标 '{name}' 不存在", "\033[91m"))
+        raise ValidationError(f"目标 '{name}' 不存在")
 
 
 @init.command("list-targets")
@@ -105,7 +113,8 @@ def list_targets(ctx, group, config_dir):
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
     verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
     config = cm.load_config()
     targets = config["targets"]
@@ -117,16 +126,17 @@ def list_targets(ctx, group, config_dir):
 
     if group:
         if group not in groups:
-            click.echo(formatter._colorize(f"❌ 服务组 '{group}' 不存在", "\033[91m"))
-            return
+            raise ValidationError(f"服务组 '{group}' 不存在")
         target_names = groups[group]
-        click.echo(formatter.format_group_header(group, len(target_names)))
+        if not quiet:
+            click.echo(formatter.format_group_header(group, len(target_names)))
         for name in target_names:
             if name in targets:
                 click.echo(formatter.format_target_config(name, targets[name]))
     else:
         for group_name, target_names in groups.items():
-            click.echo(formatter.format_group_header(group_name, len(target_names)))
+            if not quiet:
+                click.echo(formatter.format_group_header(group_name, len(target_names)))
             for name in target_names:
                 if name in targets:
                     click.echo(formatter.format_target_config(name, targets[name]))
@@ -141,8 +151,10 @@ def set_interval(ctx, seconds, config_dir):
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
     verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
+    validate_positive_int(seconds, "检查间隔")
     cm.update_settings(check_interval=seconds)
     click.echo(formatter._colorize(f"✅ 检查间隔已设置为 {seconds} 秒", "\033[92m"))
 
@@ -156,8 +168,10 @@ def set_timeout(ctx, seconds, config_dir):
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
     verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
+    validate_positive_int(seconds, "超时时间")
     cm.update_settings(timeout=seconds)
     click.echo(formatter._colorize(f"✅ 超时时间已设置为 {seconds} 秒", "\033[92m"))
 
@@ -171,7 +185,9 @@ def set_retries(ctx, count, config_dir):
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
     verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
+    validate_positive_int(count, "重试次数")
     cm.update_settings(retries=count)
     click.echo(formatter._colorize(f"✅ 重试次数已设置为 {count} 次", "\033[92m"))

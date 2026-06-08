@@ -22,6 +22,9 @@ class CheckResult:
     error: Optional[str] = None
     timestamp: int = field(default_factory=lambda: int(time.time()))
     details: Dict = field(default_factory=dict)
+    state_changed: bool = False
+    previous_state: Optional[str] = None
+    is_recovery: bool = False
 
     def to_dict(self) -> Dict:
         return {
@@ -31,7 +34,10 @@ class CheckResult:
             "status_code": self.status_code,
             "error": self.error,
             "timestamp": self.timestamp,
-            "details": self.details
+            "details": self.details,
+            "state_changed": self.state_changed,
+            "previous_state": self.previous_state,
+            "is_recovery": self.is_recovery
         }
 
     def get_level(self, thresholds: Dict) -> str:
@@ -240,46 +246,86 @@ class HealthChecker:
 class AlertManager:
     def __init__(self, config_manager):
         self.config_manager = config_manager
-        self.consecutive_failures = {}
 
-    def check_alert(self, result: CheckResult, thresholds: Dict) -> Optional[Dict]:
+    def check_alert(self, result: CheckResult, thresholds: Dict) -> Tuple[Optional[Dict], Optional[Dict]]:
         target = result.target
 
         if self.config_manager.is_muted(target):
-            return None
+            return None, None
+
+        last_status = self.config_manager.get_last_status(target)
+        current_level = result.get_level(thresholds)
+
+        result.previous_state = last_status
+        result.state_changed = last_status != current_level
+        result.is_recovery = False
 
         if not result.success:
-            self.consecutive_failures[target] = self.consecutive_failures.get(target, 0) + 1
+            consecutive = self.config_manager.increment_consecutive_failures(target)
         else:
-            self.consecutive_failures[target] = 0
+            consecutive = 0
+            self.config_manager.reset_consecutive_failures(target)
 
-        level = result.get_level(thresholds)
+            active_event = self.config_manager.get_active_event(target)
+            if active_event and last_status in ["critical", "warning"] and current_level == "ok":
+                result.is_recovery = True
+
+        self.config_manager.set_last_status(target, current_level)
+
         should_alert = False
         alert_type = ""
 
         if not result.success:
-            if self.consecutive_failures[target] >= thresholds.get("consecutive_failures", 3):
+            if consecutive >= thresholds.get("consecutive_failures", 3):
                 should_alert = True
                 alert_type = "failure"
-        elif level == "critical":
+        elif result.state_changed and current_level == "critical":
             should_alert = True
             alert_type = "slow_critical"
-        elif level == "warning":
+        elif result.state_changed and current_level == "warning":
             should_alert = True
             alert_type = "slow_warning"
 
+        alert = None
+        event = None
+
         if should_alert:
+            message = result.error or f"Response time {result.response_time:.0f}ms exceeded threshold"
+
             alert = {
                 "id": str(uuid.uuid4()),
                 "target": target,
                 "type": alert_type,
-                "level": level,
-                "message": result.error or f"Response time {result.response_time:.0f}ms exceeded threshold",
+                "level": current_level,
+                "message": message,
                 "response_time": result.response_time,
                 "timestamp": result.timestamp,
-                "consecutive_failures": self.consecutive_failures.get(target, 0)
+                "consecutive_failures": consecutive
             }
-            self.config_manager.add_alert(alert)
-            return alert
 
+            event = self.config_manager.create_or_update_event(
+                target, current_level, message, alert
+            )
+            alert["event_id"] = event["id"]
+
+            self.config_manager.add_alert(alert)
+
+        return alert, event
+
+    def check_recovery(self, result: CheckResult, thresholds: Dict) -> Optional[Dict]:
+        if result.is_recovery:
+            target = result.target
+            active_event = self.config_manager.get_active_event(target)
+            if active_event:
+                recovery_info = {
+                    "target": target,
+                    "event_id": active_event["id"],
+                    "previous_level": result.previous_state,
+                    "current_level": result.get_level(thresholds),
+                    "response_time": result.response_time,
+                    "timestamp": result.timestamp,
+                    "duration_seconds": result.timestamp - active_event["start_time"],
+                    "alert_count": active_event.get("alert_count", 1)
+                }
+                return recovery_info
         return None

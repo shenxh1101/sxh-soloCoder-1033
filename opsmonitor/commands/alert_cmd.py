@@ -1,221 +1,316 @@
 import click
-from opsmonitor.config import ConfigManager
+from opsmonitor.config import ConfigManager, ValidationError
 from opsmonitor.formatter import OutputFormatter
 
 
 @click.group()
 def alert():
-    """告警管理：阈值设置、静音、查看、处理"""
+    """告警管理"""
     pass
 
 
-@alert.command("set-threshold")
-@click.option("--warning", type=int, help="警告响应时间阈值（毫秒）")
-@click.option("--critical", type=int, help="严重响应时间阈值（毫秒）")
-@click.option("--failures", type=int, help="连续失败次数阈值")
-@click.option("--config-dir", type=click.Path(), help="配置目录路径")
-@click.pass_context
-def set_threshold(ctx, warning, critical, failures, config_dir):
-    """设置告警阈值"""
-    from pathlib import Path
-    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
-    verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
-
-    kwargs = {}
-    if warning is not None:
-        kwargs["response_time_warning"] = warning
-    if critical is not None:
-        kwargs["response_time_critical"] = critical
-    if failures is not None:
-        kwargs["consecutive_failures"] = failures
-
-    if not kwargs:
-        click.echo(formatter._colorize("⚠️  请至少指定一个阈值参数", "\033[93m"))
-        return
-
-    cm.update_thresholds(**kwargs)
-    click.echo(formatter._colorize("✅ 阈值已更新", "\033[92m"))
-
-    if verbose:
-        config = cm.load_config()
-        click.echo("\n当前阈值:")
-        for k, v in config["thresholds"].items():
-            click.echo(f"  {k}: {v}")
-
-
-@alert.command("show-thresholds")
-@click.option("--config-dir", type=click.Path(), help="配置目录路径")
-@click.pass_context
-def show_thresholds(ctx, config_dir):
-    """显示当前阈值配置"""
-    from pathlib import Path
-    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
-    verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
-
-    config = cm.load_config()
-    thresholds = config["thresholds"]
-
-    click.echo(formatter._colorize("📏 当前告警阈值:", "\033[96m"))
-    click.echo(f"  响应时间警告: {thresholds['response_time_warning']}ms")
-    click.echo(f"  响应时间严重: {thresholds['response_time_critical']}ms")
-    click.echo(f"  连续失败次数: {thresholds['consecutive_failures']} 次")
-
-
-@alert.command("mute")
-@click.argument("target")
-@click.option("--duration", type=int, default=60, help="静音时长（分钟），默认60分钟")
-@click.option("--reason", default="", help="静音原因")
-@click.option("--config-dir", type=click.Path(), help="配置目录路径")
-@click.pass_context
-def mute(ctx, target, duration, reason, config_dir):
-    """静音某个目标的告警"""
-    from pathlib import Path
-    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
-    verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
-
-    success = cm.mute_target(target, duration, reason)
-    if success:
-        click.echo(formatter._colorize(f"🔇 目标 '{target}' 已静音 {duration} 分钟", "\033[92m"))
-    else:
-        click.echo(formatter._colorize(f"❌ 目标 '{target}' 不存在", "\033[91m"))
-
-
-@alert.command("unmute")
-@click.argument("target")
-@click.option("--config-dir", type=click.Path(), help="配置目录路径")
-@click.pass_context
-def unmute(ctx, target, config_dir):
-    """取消目标静音"""
-    from pathlib import Path
-    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
-    verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
-
-    success = cm.unmute_target(target)
-    if success:
-        click.echo(formatter._colorize(f"🔊 目标 '{target}' 已取消静音", "\033[92m"))
-    else:
-        click.echo(formatter._colorize(f"⚠️  目标 '{target}' 未被静音", "\033[93m"))
-
-
-@alert.command("list-muted")
-@click.option("--config-dir", type=click.Path(), help="配置目录路径")
-@click.pass_context
-def list_muted(ctx, config_dir):
-    """列出所有静音的目标"""
-    from pathlib import Path
-    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
-    verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
-
-    config = cm.load_config()
-    muted = config.get("muted", {})
-
-    if not muted:
-        click.echo(formatter._colorize("✅ 暂无静音目标", "\033[92m"))
-        return
-
-    click.echo(formatter._colorize(f"🔇 当前静音目标 ({len(muted)} 个):", "\033[96m"))
-    for name, info in muted.items():
-        if cm.is_muted(name):
-            click.echo(formatter.format_muted_target(name, info))
-
-
 @alert.command("list")
-@click.option("--target", help="按目标筛选")
-@click.option("--unhandled-only", is_flag=True, help="只显示未处理的告警")
-@click.option("--limit", type=int, default=50, help="显示数量限制")
+@click.option("--target", help="按目标名称筛选")
+@click.option("--only-unhandled", is_flag=True, help="仅显示未处理告警")
+@click.option("--only-muted", is_flag=True, help="仅显示已静音目标的告警")
+@click.option("--level", type=click.Choice(["critical", "warning"]), help="按严重级别筛选")
+@click.option("--group", help="按服务组筛选")
+@click.option("--limit", type=int, default=50, help="显示条数限制")
 @click.option("--config-dir", type=click.Path(), help="配置目录路径")
 @click.pass_context
-def list_alerts(ctx, target, unhandled_only, limit, config_dir):
-    """查看告警列表"""
+def list_alerts(ctx, target, only_unhandled, only_muted, level, group, limit, config_dir):
+    """列出告警"""
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
-    verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
 
-    alerts = cm.get_alerts(target_name=target, only_unhandled=unhandled_only)
-    alerts = alerts[-limit:] if limit else alerts
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    alerts = cm.get_alerts(
+        target_name=target,
+        only_unhandled=only_unhandled,
+        only_muted=only_muted,
+        level=level,
+        group=group
+    )
 
     if not alerts:
-        msg = "✅ 暂无告警" if not unhandled_only else "✅ 暂无未处理告警"
-        click.echo(formatter._colorize(msg, "\033[92m"))
+        click.echo(formatter._colorize("✅ 当前无告警", "\033[92m"))
         return
 
-    unhandled_count = sum(1 for a in alerts if not a.get("handled", False))
-    click.echo(formatter._colorize(f"🚨 告警列表 ({len(alerts)} 条, {unhandled_count} 条未处理):", "\033[96m"))
-    click.echo("-" * 80)
+    filtered = alerts[:limit]
 
-    for alert in reversed(alerts):
+    if not quiet:
+        filters = []
+        if target:
+            filters.append(f"目标={target}")
+        if only_unhandled:
+            filters.append("仅未处理")
+        if only_muted:
+            filters.append("仅已静音")
+        if level:
+            filters.append(f"级别={level}")
+        if group:
+            filters.append(f"组={group}")
+        filter_str = f" (筛选: {', '.join(filters)})" if filters else ""
+        click.echo(formatter._colorize(f"📋 告警列表 (共 {len(alerts)} 条{filter_str}):", "\033[94m"))
+        if verbose:
+            click.echo("-" * 100)
+
+    for alert in filtered:
         click.echo(formatter.format_alert(alert))
+
+    if quiet:
+        unhandled = sum(1 for a in alerts if not a.get("handled"))
+        critical = sum(1 for a in alerts if a.get("level") == "critical")
+        warning = sum(1 for a in alerts if a.get("level") == "warning")
+        click.echo(formatter._colorize(
+            f"共 {len(alerts)} 条告警, 未处理 {unhandled}, 严重 {critical}, 警告 {warning}",
+            "\033[93m"
+        ))
 
 
 @alert.command("handle")
 @click.argument("alert_id")
-@click.option("--note", default="", help="处理备注")
+@click.option("--note", help="处理备注")
+@click.option("--handler", help="处理人姓名")
+@click.option("--conclusion", type=click.Choice(["resolved", "false_alarm", "known_issue", "delegated"]), help="处理结论")
+@click.option("--recovery-time", help="恢复时间 (YYYY-MM-DD HH:MM:SS)")
 @click.option("--config-dir", type=click.Path(), help="配置目录路径")
 @click.pass_context
-def handle_alert(ctx, alert_id, note, config_dir):
-    """标记单个告警为已处理"""
+def handle_alert(ctx, alert_id, note, handler, conclusion, recovery_time, config_dir):
+    """标记告警已处理"""
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
-    verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
 
-    success = cm.mark_alert_handled(alert_id, note)
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    success = cm.mark_alert_handled(
+        alert_id=alert_id,
+        note=note,
+        handler=handler,
+        conclusion=conclusion,
+        recovery_time=recovery_time
+    )
+
     if success:
-        click.echo(formatter._colorize(f"✅ 告警 {alert_id[:8]}... 已标记为已处理", "\033[92m"))
+        msg = f"✅ 告警 {alert_id} 已标记为已处理"
+        if handler and not quiet:
+            msg += f"（处理人: {handler}）"
+        if conclusion and not quiet:
+            msg += f"（结论: {conclusion}）"
+        click.echo(formatter._colorize(msg, "\033[92m"))
     else:
-        click.echo(formatter._colorize(f"❌ 未找到告警 ID: {alert_id}", "\033[91m"))
+        raise ValidationError(f"告警 {alert_id} 不存在")
 
 
 @alert.command("handle-target")
-@click.argument("target")
-@click.option("--note", default="", help="处理备注")
+@click.argument("target_name")
+@click.option("--note", help="处理备注")
+@click.option("--handler", help="处理人姓名")
+@click.option("--conclusion", type=click.Choice(["resolved", "false_alarm", "known_issue", "delegated"]), help="处理结论")
+@click.option("--recovery-time", help="恢复时间 (YYYY-MM-DD HH:MM:SS)")
 @click.option("--config-dir", type=click.Path(), help="配置目录路径")
 @click.pass_context
-def handle_target(ctx, target, note, config_dir):
-    """标记某个目标的所有告警为已处理"""
+def handle_target(ctx, target_name, note, handler, conclusion, recovery_time, config_dir):
+    """标记目标的所有告警已处理"""
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
-    verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
 
-    count = cm.mark_target_alerts_handled(target, note)
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    count = cm.mark_target_alerts_handled(
+        target_name=target_name,
+        note=note,
+        handler=handler,
+        conclusion=conclusion,
+        recovery_time=recovery_time
+    )
+
     if count > 0:
-        click.echo(formatter._colorize(f"✅ 目标 '{target}' 的 {count} 条告警已标记为已处理", "\033[92m"))
+        msg = f"✅ 目标 '{target_name}' 的 {count} 条告警已标记为已处理"
+        if handler and not quiet:
+            msg += f"（处理人: {handler}）"
+        if conclusion and not quiet:
+            msg += f"（结论: {conclusion}）"
+        click.echo(formatter._colorize(msg, "\033[92m"))
     else:
-        click.echo(formatter._colorize(f"⚠️  目标 '{target}' 没有未处理的告警", "\033[93m"))
+        click.echo(formatter._colorize(f"⚠️  目标 '{target_name}' 没有未处理告警", "\033[93m"))
+
+
+@alert.command("mute")
+@click.argument("target_name")
+@click.option("--minutes", type=int, default=60, help="静音时长（分钟）")
+@click.option("--config-dir", type=click.Path(), help="配置目录路径")
+@click.pass_context
+def mute_target(ctx, target_name, minutes, config_dir):
+    """静音某个目标"""
+    from pathlib import Path
+    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
+
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    if minutes <= 0:
+        raise ValidationError("静音时长必须大于 0 分钟")
+
+    config = cm.load_config()
+    if target_name not in config["targets"]:
+        raise ValidationError(f"目标 '{target_name}' 不存在")
+
+    cm.mute_target(target_name, minutes)
+    click.echo(formatter._colorize(f"✅ 目标 '{target_name}' 已静音 {minutes} 分钟", "\033[92m"))
+
+
+@alert.command("unmute")
+@click.argument("target_name")
+@click.option("--config-dir", type=click.Path(), help="配置目录路径")
+@click.pass_context
+def unmute_target(ctx, target_name, config_dir):
+    """取消静音"""
+    from pathlib import Path
+    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
+
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    config = cm.load_config()
+    if target_name not in config["targets"]:
+        raise ValidationError(f"目标 '{target_name}' 不存在")
+
+    cm.unmute_target(target_name)
+    click.echo(formatter._colorize(f"✅ 目标 '{target_name}' 已取消静音", "\033[92m"))
 
 
 @alert.command("anomalies")
-@click.option("--target", help="按目标筛选")
-@click.option("--limit", type=int, default=20, help="显示数量限制")
+@click.option("--limit", type=int, default=20, help="显示最近N条异常")
 @click.option("--config-dir", type=click.Path(), help="配置目录路径")
 @click.pass_context
-def anomalies(ctx, target, limit, config_dir):
-    """查看最近异常记录"""
+def recent_anomalies(ctx, limit, config_dir):
+    """查看最近异常"""
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
+
     verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
-    history = cm.get_history(target_name=target, limit=limit, only_errors=True)
-
-    if not history:
-        click.echo(formatter._colorize("✅ 最近无异常记录", "\033[92m"))
+    alerts = cm.get_alerts()
+    if not alerts:
+        click.echo(formatter._colorize("✅ 最近无异常", "\033[92m"))
         return
 
-    click.echo(formatter._colorize(f"⚠️  最近异常记录 ({len(history)} 条):", "\033[96m"))
-    click.echo("-" * 80)
+    anomalies = alerts[:limit]
 
-    for entry in reversed(history):
-        ts = formatter._format_time(entry.get("timestamp", 0))
-        target_name = entry.get("target", "")
-        error = entry.get("error", "Unknown error")
-        level = "critical"
+    if not quiet:
+        click.echo(formatter._colorize(f"⚠️  最近 {len(anomalies)} 条异常:", "\033[93m"))
+
+    for alert in anomalies:
+        level = alert.get("level", "warning")
+        status_color = "\033[91m" if level == "critical" else "\033[93m"
         icon = formatter._colorize("✗", "\033[91m")
-        click.echo(f"[{ts}] {icon} {target_name}: {error}")
+        time_str = alert.get("timestamp", "")
+        target = alert.get("target", "")
+        msg = alert.get("message", "")
+        click.echo(f"{icon} [{time_str}] {formatter._colorize(target, status_color)}: {msg}")
+
+
+@alert.command("events")
+@click.option("--target", help="按目标筛选")
+@click.option("--only-active", is_flag=True, help="仅显示进行中的事件")
+@click.option("--limit", type=int, default=20, help="显示条数限制")
+@click.option("--config-dir", type=click.Path(), help="配置目录路径")
+@click.pass_context
+def list_events(ctx, target, only_active, limit, config_dir):
+    """列出持续事件（合并的告警）"""
+    from pathlib import Path
+    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
+
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    events = cm.get_events(
+        target=target,
+        only_active=only_active,
+        limit=limit
+    )
+
+    if not events:
+        click.echo(formatter._colorize("✅ 当前无持续事件", "\033[92m"))
+        return
+
+    if not quiet:
+        filters = []
+        if target:
+            filters.append(f"目标={target}")
+        if only_active:
+            filters.append("仅进行中")
+        filter_str = f" (筛选: {', '.join(filters)})" if filters else ""
+        click.echo(formatter._colorize(f"📋 持续事件列表 (共 {len(events)} 条{filter_str}):", "\033[94m"))
+        if verbose:
+            click.echo("-" * 100)
+
+    for event in events:
+        click.echo(formatter.format_event(event))
+
+    if quiet:
+        active = sum(1 for e in events if e.get("active"))
+        closed = sum(1 for e in events if not e.get("active"))
+        click.echo(formatter._colorize(
+            f"共 {len(events)} 条事件, 进行中 {active}, 已结束 {closed}",
+            "\033[93m"
+        ))
+
+
+@alert.command("set-threshold")
+@click.option("--warning-ms", type=int, help="警告响应时间阈值(毫秒)")
+@click.option("--critical-ms", type=int, help="严重响应时间阈值(毫秒)")
+@click.option("--fail-count", type=int, help="连续失败次数阈值")
+@click.option("--config-dir", type=click.Path(), help="配置目录路径")
+@click.pass_context
+def set_threshold(ctx, warning_ms, critical_ms, fail_count, config_dir):
+    """设置告警阈值"""
+    from pathlib import Path
+    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
+
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    params = {}
+    if warning_ms is not None:
+        if warning_ms <= 0:
+            raise ValidationError("警告响应时间阈值必须大于 0")
+        params["warning_response_ms"] = warning_ms
+    if critical_ms is not None:
+        if critical_ms <= 0:
+            raise ValidationError("严重响应时间阈值必须大于 0")
+        params["critical_response_ms"] = critical_ms
+    if fail_count is not None:
+        if fail_count <= 0:
+            raise ValidationError("连续失败次数阈值必须大于 0")
+        params["consecutive_failures"] = fail_count
+
+    if not params:
+        raise ValidationError("请至少指定一个阈值参数")
+
+    cm.update_thresholds(**params)
+
+    msg_parts = []
+    for k, v in params.items():
+        if k == "warning_response_ms":
+            msg_parts.append(f"警告={v}ms")
+        elif k == "critical_response_ms":
+            msg_parts.append(f"严重={v}ms")
+        elif k == "consecutive_failures":
+            msg_parts.append(f"连续失败={v}次")
+
+    click.echo(formatter._colorize(f"✅ 阈值已更新: {', '.join(msg_parts)}", "\033[92m"))

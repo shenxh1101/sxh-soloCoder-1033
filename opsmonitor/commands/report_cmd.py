@@ -1,348 +1,478 @@
-import time
 import json
 import csv
 from datetime import datetime, timedelta
-from pathlib import Path
+from io import StringIO
 import click
-from opsmonitor.config import ConfigManager
-from opsmonitor.formatter import OutputFormatter
+from opsmonitor.config import ConfigManager, ValidationError
+from opsmonitor.formatter import OutputFormatter, percentile, p95, p99, format_duration
 
 
-@click.group()
-def report():
-    """生成值班报告和故障时间线"""
-    pass
+def _calculate_stats(history_entries):
+    """计算统计数据"""
+    success_times = []
+    failed_times = []
+    total_count = len(history_entries)
+    success_count = 0
+    failed_count = 0
+    min_time = None
+    max_time = None
+
+    for entry in history_entries:
+        if entry.get("success"):
+            success_count += 1
+            rt = entry.get("response_time_ms")
+            if rt is not None:
+                success_times.append(rt)
+                if min_time is None or rt < min_time:
+                    min_time = rt
+                if max_time is None or rt > max_time:
+                    max_time = rt
+        else:
+            failed_count += 1
+            rt = entry.get("response_time_ms")
+            if rt is not None:
+                failed_times.append(rt)
+
+    avg_time = sum(success_times) / len(success_times) if success_times else 0
+    median_time = sorted(success_times)[len(success_times) // 2] if success_times else 0
+    p95_time = p95(success_times) if success_times else 0
+    p99_time = p99(success_times) if success_times else 0
+    success_rate = (success_count / total_count * 100) if total_count > 0 else 0
+
+    return {
+        "total_count": total_count,
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "success_rate": success_rate,
+        "avg_response_ms": avg_time,
+        "median_response_ms": median_time,
+        "p95_response_ms": p95_time,
+        "p99_response_ms": p99_time,
+        "min_response_ms": min_time,
+        "max_response_ms": max_time,
+        "all_response_times": success_times,
+    }
 
 
-@report.command("export")
-@click.option("--format", "output_format", type=click.Choice(["txt", "json", "csv"]), default="txt", help="输出格式")
-@click.option("--output", "-o", type=click.Path(), help="输出文件路径")
-@click.option("--hours", type=int, default=24, help="统计最近多少小时的数据")
-@click.option("--config-dir", type=click.Path(), help="配置目录路径")
-@click.pass_context
-def export_report(ctx, output_format, output, hours, config_dir):
-    """导出值班报告"""
-    from pathlib import Path
-    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
-    verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
+def _parse_timestamp(ts):
+    """解析时间戳，支持int和str格式"""
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        return datetime.fromtimestamp(int(ts))
+    if isinstance(ts, str):
+        try:
+            return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            try:
+                return datetime.fromtimestamp(int(ts))
+            except ValueError:
+                return None
+    return None
+
+
+def _calculate_outage_durations(history_entries):
+    """计算故障时长 - 返回最长和平均故障时长（秒）"""
+    if not history_entries:
+        return 0, 0
+
+    current_failure_start = None
+    max_duration = 0
+    total_duration = 0
+    failure_count = 0
+
+    sorted_entries = sorted(
+        history_entries,
+        key=lambda x: _parse_timestamp(x.get("timestamp", 0)) or datetime.fromtimestamp(0)
+    )
+
+    for entry in sorted_entries:
+        ts = entry.get("timestamp")
+        dt = _parse_timestamp(ts)
+        if dt is None:
+            continue
+
+        if not entry.get("success"):
+            if current_failure_start is None:
+                current_failure_start = dt
+        else:
+            if current_failure_start is not None:
+                duration = (dt - current_failure_start).total_seconds()
+                max_duration = max(max_duration, duration)
+                total_duration += duration
+                failure_count += 1
+                current_failure_start = None
+
+    if current_failure_start is not None:
+        last_dt = None
+        for entry in reversed(sorted_entries):
+            last_dt = _parse_timestamp(entry.get("timestamp"))
+            if last_dt:
+                break
+        if last_dt:
+            duration = (last_dt - current_failure_start).total_seconds()
+            max_duration = max(max_duration, duration)
+            total_duration += duration
+            failure_count += 1
+
+    avg_duration = total_duration / failure_count if failure_count > 0 else 0
+    return max_duration, avg_duration
+
+
+def _generate_report_data(cm, hours=24):
+    """生成完整的报表数据"""
+    end_time = datetime.now()
+    start_time = end_time - timedelta(hours=hours)
 
     config = cm.load_config()
-    thresholds = config["thresholds"]
+    all_history = cm.get_history(start_time=start_time, end_time=end_time, limit=10000)
+    all_alerts = cm.get_alerts()
+    all_events = cm.get_events(limit=100)
 
-    now = int(time.time())
-    start_time = now - hours * 3600
+    target_stats = {}
+    for target_name in config["targets"]:
+        target_history = [h for h in all_history if h.get("target") == target_name]
+        stats = _calculate_stats(target_history)
+        max_outage, avg_outage = _calculate_outage_durations(target_history)
+        stats["longest_outage_sec"] = max_outage
+        stats["avg_outage_sec"] = avg_outage
+        target_stats[target_name] = stats
 
-    history = cm.get_history(limit=10000)
-    history = [h for h in history if h.get("timestamp", 0) >= start_time]
+    group_stats = {}
+    for group_name, target_names in config["groups"].items():
+        group_history = []
+        for t in target_names:
+            if t in config["targets"]:
+                group_history.extend([h for h in all_history if h.get("target") == t])
+        gstats = _calculate_stats(group_history)
 
-    alerts = cm.get_alerts()
-    alerts = [a for a in alerts if a.get("timestamp", 0) >= start_time]
+        target_max_outages = []
+        target_avg_outages = []
+        for t in target_names:
+            if t in target_stats:
+                target_max_outages.append(target_stats[t]["longest_outage_sec"])
+                target_avg_outages.append(target_stats[t]["avg_outage_sec"])
 
-    targets = config["targets"]
-    groups = config["groups"]
+        gstats["longest_outage_sec"] = max(target_max_outages) if target_max_outages else 0
+        gstats["avg_outage_sec"] = sum(target_avg_outages) / len(target_avg_outages) if target_avg_outages else 0
+        group_stats[group_name] = gstats
 
-    report_data = {
-        "report_time": now,
-        "start_time": start_time,
-        "hours": hours,
-        "summary": {},
-        "targets": {},
-        "alerts": alerts,
-        "groups": {}
+    failure_ranking = sorted(
+        [
+            {
+                "target": t,
+                "failures": s["failed_count"],
+                "longest_outage": s.get("longest_outage_sec", 0),
+                "total_downtime": s.get("avg_outage_sec", 0) * s.get("failed_count", 0)
+            }
+            for t, s in target_stats.items()
+            if s["failed_count"] > 0
+        ],
+        key=lambda x: x["failures"],
+        reverse=True
+    )
+
+    return {
+        "period": {
+            "start_time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "hours": hours
+        },
+        "targets": target_stats,
+        "groups": group_stats,
+        "failure_ranking": failure_ranking,
+        "alerts_count": len(all_alerts),
+        "unhandled_alerts_count": sum(1 for a in all_alerts if not a.get("handled")),
+        "events_count": len(all_events),
+        "active_events_count": sum(1 for e in all_events if e.get("active")),
+        "config": config
     }
 
-    total_checks = len(history)
-    successful_checks = sum(1 for h in history if h.get("success", False))
-    failed_checks = total_checks - successful_checks
 
-    total_alerts = len(alerts)
-    unhandled_alerts = sum(1 for a in alerts if not a.get("handled", False))
-    critical_alerts = sum(1 for a in alerts if a.get("level") == "critical")
-    warning_alerts = sum(1 for a in alerts if a.get("level") == "warning")
+def _generate_text_report(report_data, formatter, quiet=False, verbose=False):
+    """生成文本报表"""
+    output = []
 
-    report_data["summary"] = {
-        "total_checks": total_checks,
-        "successful_checks": successful_checks,
-        "failed_checks": failed_checks,
-        "success_rate": (successful_checks / total_checks * 100) if total_checks > 0 else 0,
-        "total_alerts": total_alerts,
-        "unhandled_alerts": unhandled_alerts,
-        "critical_alerts": critical_alerts,
-        "warning_alerts": warning_alerts,
-        "targets_count": len(targets),
-        "groups_count": len(groups)
-    }
+    if not quiet:
+        period = report_data["period"]
+        output.append(formatter.format_report_section(
+            "值班报告",
+            f"统计周期: {period['start_time']} 至 {period['end_time']} ({period['hours']} 小时)"
+        ))
+        output.append("")
 
-    for target_name, target_config in targets.items():
-        target_history = [h for h in history if h.get("target") == target_name]
-        target_alerts = [a for a in alerts if a.get("target") == target_name]
+        total_targets = len(report_data["targets"])
+        total_checks = sum(s["total_count"] for s in report_data["targets"].values())
+        total_success = sum(s["success_count"] for s in report_data["targets"].values())
+        overall_rate = (total_success / total_checks * 100) if total_checks > 0 else 0
 
-        if target_history:
-            response_times = [h.get("response_time", 0) for h in target_history if h.get("success", False)]
-            avg_rt = sum(response_times) / len(response_times) if response_times else 0
-            max_rt = max(response_times) if response_times else 0
-            min_rt = min(response_times) if response_times else 0
-            success_count = sum(1 for h in target_history if h.get("success", False))
-            success_rate = success_count / len(target_history) * 100
-        else:
-            avg_rt = max_rt = min_rt = 0
-            success_count = 0
-            success_rate = 0
+        output.append(formatter.format_report_section(
+            "整体概览",
+            f"监控目标: {total_targets} 个 | 总检查: {total_checks} 次 | 整体可用率: {overall_rate:.1f}% | "
+            f"告警: {report_data['alerts_count']} 条 | 未处理: {report_data['unhandled_alerts_count']} 条 | "
+            f"持续事件: {report_data['events_count']} 条 (进行中 {report_data['active_events_count']} 条)"
+        ))
+        output.append("")
 
-        report_data["targets"][target_name] = {
-            "config": target_config,
-            "total_checks": len(target_history),
-            "successful_checks": success_count,
-            "success_rate": success_rate,
-            "avg_response_time": avg_rt,
-            "max_response_time": max_rt,
-            "min_response_time": min_rt,
-            "alerts_count": len(target_alerts),
-            "unhandled_alerts": sum(1 for a in target_alerts if not a.get("handled", False)),
-            "muted": cm.is_muted(target_name)
-        }
+    if not quiet:
+        output.append(formatter.format_report_section("按服务组统计", ""))
+        for group_name, gdata in sorted(report_data["groups"].items()):
+            targets = report_data["config"]["groups"].get(group_name, [])
+            target_count = len([t for t in targets if t in report_data["config"]["targets"]])
 
-    for group_name, target_names in groups.items():
-        group_checks = 0
-        group_success = 0
-        group_alerts = 0
+            if gdata["total_count"] == 0:
+                continue
 
-        for target_name in target_names:
-            tdata = report_data["targets"].get(target_name, {})
-            group_checks += tdata.get("total_checks", 0)
-            group_success += tdata.get("successful_checks", 0)
-            group_alerts += tdata.get("alerts_count", 0)
+            status_color = "\033[92m" if gdata["success_rate"] >= 99.9 else "\033[93m" if gdata["success_rate"] >= 95 else "\033[91m"
+            success_rate_str = f"{gdata['success_rate']:.1f}%"
+            availability_str = formatter.format_availability(f"{group_name} ({target_count}个目标)", gdata["success_count"], gdata["total_count"])
 
-        report_data["groups"][group_name] = {
-            "targets_count": len(target_names),
-            "total_checks": group_checks,
-            "successful_checks": group_success,
-            "success_rate": (group_success / group_checks * 100) if group_checks > 0 else 0,
-            "alerts_count": group_alerts
-        }
+            output.append(availability_str)
+            if not quiet:
+                output.append(f"  成功率: {formatter._colorize(success_rate_str, status_color)}")
+                output.append(formatter.format_stats("响应时间", gdata["all_response_times"], "ms"))
+                longest_outage_str = format_duration(gdata["longest_outage_sec"]) if gdata["longest_outage_sec"] > 0 else "无"
+                output.append(f"  最长故障时长: {longest_outage_str}")
+                output.append("")
 
-    if output_format == "json":
-        content = json.dumps(report_data, indent=2, ensure_ascii=False)
-    elif output_format == "csv":
-        content = _generate_csv_report(report_data, formatter)
-    else:
-        content = _generate_text_report(report_data, formatter, verbose)
+    if report_data["failure_ranking"] and not quiet:
+        output.append(formatter.format_failure_ranking(report_data["failure_ranking"]))
+        output.append("")
 
-    if output:
-        output_path = Path(output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        click.echo(formatter._colorize(f"✅ 报告已导出到: {output_path}", "\033[92m"))
-    else:
-        click.echo(content)
+    if verbose and not quiet:
+        output.append(formatter.format_report_section("各目标详细统计", ""))
+        for target_name, tdata in sorted(report_data["targets"].items()):
+            if tdata["total_count"] == 0:
+                continue
+
+            target_config = report_data["config"]["targets"].get(target_name, {})
+            status_color = "\033[92m" if tdata["success_rate"] >= 99.9 else "\033[93m" if tdata["success_rate"] >= 95 else "\033[91m"
+            success_rate_str = f"{tdata['success_rate']:.1f}%"
+
+            output.append(f"\n{target_name} ({target_config.get('type', 'http')}://{target_config.get('address', '')})")
+            output.append(f"  检查次数: {tdata['total_count']} | 成功: {tdata['success_count']} | 失败: {tdata['failed_count']} | 成功率: {formatter._colorize(success_rate_str, status_color)}")
+            output.append(formatter.format_stats("响应时间", tdata["all_response_times"], "ms"))
+            longest_outage_str = format_duration(tdata["longest_outage_sec"]) if tdata["longest_outage_sec"] > 0 else "无"
+            avg_outage_str = format_duration(tdata["avg_outage_sec"]) if tdata["avg_outage_sec"] > 0 else "无"
+            output.append(f"  最长故障时长: {longest_outage_str} | 平均故障时长: {avg_outage_str}")
+
+    if quiet:
+        total_targets = len(report_data["targets"])
+        total_checks = sum(s["total_count"] for s in report_data["targets"].values())
+        total_success = sum(s["success_count"] for s in report_data["targets"].values())
+        overall_rate = (total_success / total_checks * 100) if total_checks > 0 else 0
+        worst = report_data["failure_ranking"][0] if report_data["failure_ranking"] else None
+        worst_str = f" | 故障最多: {worst['target']} ({worst['failures']}次)" if worst else ""
+        output.append(formatter._colorize(
+            f"报告: {total_targets}目标 | {total_checks}次检查 | 可用率 {overall_rate:.1f}% | {report_data['unhandled_alerts_count']}条未处理告警{worst_str}",
+            "\033[94m"
+        ))
+
+    return "\n".join(output)
 
 
-def _generate_text_report(data, formatter, verbose):
-    lines = []
-    lines.append("=" * 70)
-    lines.append(formatter._colorize("📋 运维监控值班报告", "\033[96m" + "\033[1m"))
-    lines.append("=" * 70)
-    lines.append(f"统计时段: {formatter._format_time(data['start_time'])} - {formatter._format_time(data['report_time'])}")
-    lines.append(f"统计时长: {data['hours']} 小时")
-    lines.append(f"生成时间: {formatter._format_time(data['report_time'])}")
+def _generate_json_report(report_data):
+    """生成JSON报表"""
+    def _convert_for_json(data):
+        if isinstance(data, dict):
+            return {k: _convert_for_json(v) for k, v in data.items() if k != "all_response_times"}
+        elif isinstance(data, list):
+            return [_convert_for_json(item) for item in data]
+        return data
 
-    s = data["summary"]
-    lines.append("")
-    lines.append(formatter.format_report_section("总体概览",
-        f"  监控目标数: {s['targets_count']} 个 ({s['groups_count']} 个服务组)\n"
-        f"  总检查次数: {s['total_checks']} 次\n"
-        f"  成功次数: {s['successful_checks']} 次 | 失败次数: {s['failed_checks']} 次\n"
-        f"  成功率: {s['success_rate']:.2f}%\n"
-        f"  告警总数: {s['total_alerts']} 条\n"
-        f"  - 严重告警: {s['critical_alerts']} 条\n"
-        f"  - 警告告警: {s['warning_alerts']} 条\n"
-        f"  未处理: {s['unhandled_alerts']} 条"
-    ))
-
-    lines.append(formatter.format_report_section("服务组统计", ""))
-    for group_name, gdata in data["groups"].items():
-        status_color = "\033[92m" if gdata["success_rate"] >= 95 else ("\033[93m" if gdata["success_rate"] >= 80 else "\033[91m")
-        success_rate_str = f"{gdata['success_rate']:.1f}%"
-        lines.append(f"  {formatter._colorize(group_name.ljust(20), '\033[1m')} "
-                     f"目标: {str(gdata['targets_count']).ljust(3)} | "
-                     f"检查: {str(gdata['total_checks']).ljust(6)} | "
-                     f"成功率: {formatter._colorize(success_rate_str, status_color)} | "
-                     f"告警: {gdata['alerts_count']} 条")
-
-    lines.append(formatter.format_report_section("目标详情", ""))
-    for target_name, tdata in sorted(data["targets"].items()):
-        muted = tdata["muted"]
-        status = "🔇" if muted else ("✅" if tdata["success_rate"] >= 95 else ("⚠️ " if tdata["success_rate"] >= 80 else "❌"))
-        status_color = "\033[92m" if tdata["success_rate"] >= 95 else ("\033[93m" if tdata["success_rate"] >= 80 else "\033[91m")
-        lines.append(f"  {status} {formatter._colorize(target_name.ljust(18), '\033[1m')} "
-                     f"[{tdata['config']['type']}] {tdata['config']['address']}")
-        t_success_rate = f"{tdata['success_rate']:.1f}%"
-        lines.append(f"     检查: {tdata['total_checks']} 次 | "
-                     f"成功率: {formatter._colorize(t_success_rate, status_color)} | "
-                     f"告警: {tdata['alerts_count']} 条")
-        if tdata["total_checks"] > 0:
-            lines.append(f"     平均响应: {tdata['avg_response_time']:.0f}ms | "
-                         f"最大: {tdata['max_response_time']:.0f}ms | "
-                         f"最小: {tdata['min_response_time']:.0f}ms")
-        if tdata["unhandled_alerts"] > 0:
-            lines.append(formatter._colorize(f"     ⚠️  {tdata['unhandled_alerts']} 条告警未处理", "\033[91m"))
-        if muted:
-            lines.append(formatter._colorize(f"     🔇 目标已静音", "\033[90m"))
-        if verbose:
-            lines.append(f"     组: {tdata['config'].get('group', 'default')} | "
-                         f"方法: {tdata['config'].get('method', '-')} | "
-                         f"期望状态: {tdata['config'].get('expected_status', '-')}")
-        lines.append("")
-
-    if data["alerts"]:
-        lines.append(formatter.format_report_section("告警记录", ""))
-        for alert in sorted(data["alerts"], key=lambda x: x.get("timestamp", 0)):
-            lines.append(f"  {formatter.format_alert(alert)}")
-
-    return "\n".join(lines)
+    clean_data = _convert_for_json(report_data)
+    return json.dumps(clean_data, indent=2, ensure_ascii=False)
 
 
-def _generate_csv_report(data, formatter):
-    import io
-    output = io.StringIO()
+def _generate_csv_report(report_data):
+    """生成CSV报表"""
+    output = StringIO()
     writer = csv.writer(output)
 
-    writer.writerow(["=== 运维监控值班报告 ==="])
-    writer.writerow(["统计时段", f"{formatter._format_time(data['start_time'])} - {formatter._format_time(data['report_time'])}"])
-    writer.writerow(["统计时长", f"{data['hours']} 小时"])
-    writer.writerow([])
+    writer.writerow([
+        "目标名称", "服务组", "检查次数", "成功次数", "失败次数", "成功率%",
+        "平均响应ms", "中位数ms", "P95ms", "P99ms", "最小响应ms", "最大响应ms",
+        "最长故障时长s", "平均故障时长s"
+    ])
 
-    s = data["summary"]
-    writer.writerow(["=== 总体概览 ==="])
-    writer.writerow(["监控目标数", s["targets_count"]])
-    writer.writerow(["服务组数", s["groups_count"]])
-    writer.writerow(["总检查次数", s["total_checks"]])
-    writer.writerow(["成功次数", s["successful_checks"]])
-    writer.writerow(["失败次数", s["failed_checks"]])
-    writer.writerow(["成功率(%)", f"{s['success_rate']:.2f}"])
-    writer.writerow(["告警总数", s["total_alerts"]])
-    writer.writerow(["严重告警", s["critical_alerts"]])
-    writer.writerow(["警告告警", s["warning_alerts"]])
-    writer.writerow(["未处理", s["unhandled_alerts"]])
-    writer.writerow([])
-
-    writer.writerow(["=== 目标详情 ==="])
-    writer.writerow(["目标名称", "类型", "地址", "组", "检查次数", "成功次数",
-                     "成功率(%)", "平均响应(ms)", "最大响应(ms)", "最小响应(ms)",
-                     "告警数", "未处理告警", "是否静音"])
-    for target_name, tdata in data["targets"].items():
+    config = report_data["config"]
+    for target_name, tdata in sorted(report_data["targets"].items()):
+        target_config = config["targets"].get(target_name, {})
+        group = target_config.get("group", "default")
         writer.writerow([
             target_name,
-            tdata["config"]["type"],
-            tdata["config"]["address"],
-            tdata["config"].get("group", "default"),
-            tdata["total_checks"],
-            tdata["successful_checks"],
+            group,
+            tdata["total_count"],
+            tdata["success_count"],
+            tdata["failed_count"],
             f"{tdata['success_rate']:.2f}",
-            f"{tdata['avg_response_time']:.0f}",
-            f"{tdata['max_response_time']:.0f}",
-            f"{tdata['min_response_time']:.0f}",
-            tdata["alerts_count"],
-            tdata["unhandled_alerts"],
-            "是" if tdata["muted"] else "否"
+            f"{tdata['avg_response_ms']:.2f}",
+            f"{tdata['median_response_ms']:.2f}",
+            f"{tdata['p95_response_ms']:.2f}",
+            f"{tdata['p99_response_ms']:.2f}",
+            tdata["min_response_ms"] or "",
+            tdata["max_response_ms"] or "",
+            f"{tdata['longest_outage_sec']:.1f}",
+            f"{tdata['avg_outage_sec']:.1f}"
         ])
-    writer.writerow([])
 
-    if data["alerts"]:
-        writer.writerow(["=== 告警记录 ==="])
-        writer.writerow(["时间", "目标", "级别", "类型", "消息", "响应时间(ms)", "连续失败", "是否处理", "处理备注"])
-        for alert in data["alerts"]:
-            writer.writerow([
-                formatter._format_time(alert.get("timestamp", 0)),
-                alert.get("target", ""),
-                alert.get("level", ""),
-                alert.get("type", ""),
-                alert.get("message", ""),
-                f"{alert.get('response_time', 0):.0f}",
-                alert.get("consecutive_failures", 0),
-                "是" if alert.get("handled", False) else "否",
-                alert.get("handled_note", "")
-            ])
+    writer.writerow([])
+    writer.writerow(["=== 按服务组统计 ==="])
+    writer.writerow([
+        "服务组", "目标数", "检查次数", "成功次数", "失败次数", "成功率%",
+        "平均响应ms", "中位数ms", "P95ms", "P99ms", "最长故障时长s", "平均故障时长s"
+    ])
+
+    for group_name, gdata in sorted(report_data["groups"].items()):
+        targets = config["groups"].get(group_name, [])
+        target_count = len([t for t in targets if t in config["targets"]])
+        writer.writerow([
+            group_name,
+            target_count,
+            gdata["total_count"],
+            gdata["success_count"],
+            gdata["failed_count"],
+            f"{gdata['success_rate']:.2f}",
+            f"{gdata['avg_response_ms']:.2f}",
+            f"{gdata['median_response_ms']:.2f}",
+            f"{gdata['p95_response_ms']:.2f}",
+            f"{gdata['p99_response_ms']:.2f}",
+            f"{gdata['longest_outage_sec']:.1f}",
+            f"{gdata['avg_outage_sec']:.1f}"
+        ])
+
+    writer.writerow([])
+    writer.writerow(["=== 故障次数排行 ==="])
+    writer.writerow(["排名", "目标名称", "故障次数"])
+
+    for i, item in enumerate(report_data["failure_ranking"], 1):
+        writer.writerow([i, item["target"], item["failures"]])
 
     return output.getvalue()
 
 
-@report.command("timeline")
-@click.option("--target", help="按目标筛选")
-@click.option("--hours", type=int, default=24, help="最近多少小时")
-@click.option("--output", "-o", type=click.Path(), help="输出文件路径")
+@click.group()
+def report():
+    """报表生成"""
+    pass
+
+
+@report.command()
+@click.option("--hours", type=int, default=24, help="统计时长（小时）")
+@click.option("--group", help="按服务组筛选")
 @click.option("--config-dir", type=click.Path(), help="配置目录路径")
 @click.pass_context
-def timeline(ctx, target, hours, output, config_dir):
+def overview(ctx, hours, group, config_dir):
+    """生成值班概览报告"""
+    from pathlib import Path
+    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
+
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    report_data = _generate_report_data(cm, hours=hours)
+
+    if group:
+        if group not in report_data["groups"]:
+            raise ValidationError(f"服务组 '{group}' 不存在")
+        filtered_targets = {}
+        for t in report_data["config"]["groups"].get(group, []):
+            if t in report_data["targets"]:
+                filtered_targets[t] = report_data["targets"][t]
+        report_data["targets"] = filtered_targets
+        filtered_groups = {group: report_data["groups"][group]}
+        report_data["groups"] = filtered_groups
+
+    text_report = _generate_text_report(report_data, formatter, quiet=quiet, verbose=verbose)
+    click.echo(text_report)
+
+
+@report.command()
+@click.option("--hours", type=int, default=24, help="统计时长（小时）")
+@click.option("--output", "-o", type=click.Path(), help="输出文件路径")
+@click.option("--format", "fmt", type=click.Choice(["json", "csv"]), default="json", help="输出格式")
+@click.option("--config-dir", type=click.Path(), help="配置目录路径")
+@click.pass_context
+def export(ctx, hours, output, fmt, config_dir):
+    """导出值班报告"""
+    from pathlib import Path
+    cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
+
+    verbose = ctx.obj.get("verbose", False)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
+
+    if hours <= 0:
+        raise ValidationError("统计时长必须大于 0 小时")
+
+    report_data = _generate_report_data(cm, hours=hours)
+
+    if fmt == "json":
+        content = _generate_json_report(report_data)
+    else:
+        content = _generate_csv_report(report_data)
+
+    if output:
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(content)
+        click.echo(formatter._colorize(f"✅ 报告已导出到 {output} ({fmt} 格式)", "\033[92m"))
+    else:
+        click.echo(content)
+
+
+@report.command("timeline")
+@click.option("--target", help="按目标筛选")
+@click.option("--hours", type=int, default=24, help="统计时长（小时）")
+@click.option("--config-dir", type=click.Path(), help="配置目录路径")
+@click.pass_context
+def timeline(ctx, target, hours, config_dir):
     """生成故障时间线"""
     from pathlib import Path
     cm = ConfigManager(Path(config_dir)) if config_dir else ConfigManager()
+
     verbose = ctx.obj.get("verbose", False)
-    formatter = OutputFormatter(verbose=verbose)
+    quiet = ctx.obj.get("quiet", False)
+    formatter = OutputFormatter(verbose=verbose, quiet=quiet)
 
-    now = int(time.time())
-    start_time = now - hours * 3600
+    if hours <= 0:
+        raise ValidationError("统计时长必须大于 0 小时")
 
-    history = cm.get_history(target_name=target, limit=10000, only_errors=True)
-    history = [h for h in history if h.get("timestamp", 0) >= start_time]
+    end_time = datetime.now()
+    start_time = end_time - timedelta(hours=hours)
 
     alerts = cm.get_alerts(target_name=target)
-    alerts = [a for a in alerts if a.get("timestamp", 0) >= start_time]
-
-    events = []
-
-    for h in history:
-        events.append({
-            "timestamp": h.get("timestamp", 0),
-            "type": "failure",
-            "target": h.get("target", ""),
-            "level": "critical",
-            "message": h.get("error", "检查失败")
-        })
-
+    filtered = []
     for a in alerts:
-        events.append({
-            "timestamp": a.get("timestamp", 0),
-            "type": "alert",
-            "target": a.get("target", ""),
-            "level": a.get("level", "warning"),
-            "message": f"[ALERT] {a.get('message', '')}"
-        })
+        ts = _parse_timestamp(a.get("timestamp"))
+        if ts and start_time <= ts <= end_time:
+            filtered.append(a)
 
-    events.sort(key=lambda x: x["timestamp"])
-
-    if not events:
-        click.echo(formatter._colorize(f"✅ 最近 {hours} 小时无故障事件", "\033[92m"))
+    if not filtered:
+        click.echo(formatter._colorize("✅ 该时间段内无告警", "\033[92m"))
         return
 
-    lines = []
-    lines.append("=" * 70)
-    lines.append(formatter._colorize(f"⏱️  故障时间线 (最近 {hours} 小时)", "\033[96m" + "\033[1m"))
-    lines.append("=" * 70)
-    lines.append(f"统计时段: {formatter._format_time(start_time)} - {formatter._format_time(now)}")
-    lines.append(f"事件总数: {len(events)} 个")
-    lines.append("")
+    if not quiet:
+        click.echo(formatter._colorize(f"⏱️  故障时间线 ({hours}小时内):", "\033[94m"))
 
-    last_time = None
-    for event in events:
-        current_time = datetime.fromtimestamp(event["timestamp"])
-        if last_time:
-            gap = current_time - last_time
-            if gap.total_seconds() > 300:
-                lines.append(formatter._colorize(f"  ... {gap.total_seconds() / 60:.0f} 分钟无事件 ...", "\033[90m"))
-        last_time = current_time
+    sorted_alerts = sorted(filtered, key=lambda a: a["timestamp"])
 
-        lines.append(formatter.format_timeline_event(event))
+    for alert in sorted_alerts:
+        level = alert.get("level", "warning")
+        status_color = "\033[91m" if level == "critical" else "\033[93m"
+        handled = alert.get("handled", False)
+        handled_marker = "[已处理]" if handled else "[未处理]"
 
-    content = "\n".join(lines)
+        line = f"[{alert['timestamp']}] {formatter._colorize(level.upper(), status_color)} {alert['target']}: {alert['message']}"
+        if verbose and not quiet:
+            line += f" {formatter._colorize(handled_marker, '\033[90m')}"
+        click.echo(line)
 
-    if output:
-        output_path = Path(output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        click.echo(formatter._colorize(f"✅ 时间线已导出到: {output_path}", "\033[92m"))
-    else:
-        click.echo(content)
+    if quiet:
+        critical_count = sum(1 for a in sorted_alerts if a.get("level") == "critical")
+        warning_count = sum(1 for a in sorted_alerts if a.get("level") == "warning")
+        handled_count = sum(1 for a in sorted_alerts if a.get("handled"))
+        click.echo(formatter._colorize(
+            f"共 {len(sorted_alerts)} 条告警, 严重 {critical_count}, 警告 {warning_count}, 已处理 {handled_count}",
+            "\033[93m"
+        ))
