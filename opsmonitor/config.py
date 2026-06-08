@@ -284,13 +284,47 @@ class ConfigManager:
 
     def add_alert(self, alert: Dict):
         alerts = self._load_json(self.alerts_file) or []
+        target = alert.get("target", "")
+        event_id = alert.get("event_id")
+
+        existing_alert = None
+        for a in alerts:
+            if (a.get("target") == target and
+                not a.get("handled", False) and
+                a.get("event_id") == event_id):
+                existing_alert = a
+                break
+
+        if existing_alert:
+            existing_alert["last_timestamp"] = alert["timestamp"]
+            existing_alert["last_message"] = alert["message"]
+            existing_alert["last_response_time"] = alert["response_time"]
+            existing_alert["last_level"] = alert["level"]
+            existing_alert["count"] = existing_alert.get("count", 1) + 1
+            existing_alert["consecutive_failures"] = alert.get("consecutive_failures", existing_alert.get("consecutive_failures", 1))
+            if alert.get("level") == "critical":
+                existing_alert["has_critical"] = True
+            self._save_json(self.alerts_file, alerts)
+            return existing_alert
+
         alert["handled"] = False
         alert["handler"] = None
         alert["conclusion"] = None
         alert["recovery_time"] = None
-        alert["event_id"] = alert.get("event_id")
+        alert["event_id"] = event_id
+        alert["first_timestamp"] = alert["timestamp"]
+        alert["last_timestamp"] = alert["timestamp"]
+        alert["first_message"] = alert["message"]
+        alert["last_message"] = alert["message"]
+        alert["first_response_time"] = alert["response_time"]
+        alert["last_response_time"] = alert["response_time"]
+        alert["first_level"] = alert["level"]
+        alert["last_level"] = alert["level"]
+        alert["count"] = 1
+        alert["has_critical"] = alert.get("level") == "critical"
         alerts.append(alert)
         self._save_json(self.alerts_file, alerts)
+        return alert
 
     def get_alerts(self, target_name: Optional[str] = None,
                    only_unhandled: bool = False,
@@ -402,11 +436,18 @@ class ConfigManager:
 
         import uuid
         event_id = str(uuid.uuid4())
+        start_time = first_alert.get("timestamp", int(time.time()))
+        if isinstance(start_time, str):
+            try:
+                dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+                start_time = int(dt.timestamp())
+            except ValueError:
+                start_time = int(time.time())
         event = {
             "id": event_id,
             "target": target,
             "first_alert_id": first_alert.get("id"),
-            "start_time": first_alert.get("timestamp", int(time.time())),
+            "start_time": start_time,
             "last_update": int(time.time()),
             "first_level": level,
             "last_level": level,
@@ -480,3 +521,32 @@ class ConfigManager:
         if target in state["active_events"]:
             del state["active_events"][target]
             self.save_state(state)
+
+    def close_event_on_recovery(self, target: str, recovery_time: Optional[int] = None) -> Optional[Dict]:
+        active_event = self.get_active_event(target)
+        if not active_event:
+            return None
+
+        event_id = active_event["id"]
+        self._close_event(
+            event_id,
+            note="自动恢复",
+            handler="system",
+            conclusion="resolved",
+            recovery_time=recovery_time
+        )
+
+        alerts = self._load_json(self.alerts_file) or []
+        for alert in alerts:
+            if (alert.get("target") == target and
+                not alert.get("handled", False) and
+                alert.get("event_id") == event_id):
+                alert["handled"] = True
+                alert["handled_note"] = "自动恢复"
+                alert["handled_at"] = int(time.time())
+                alert["handler"] = "system"
+                alert["conclusion"] = "resolved"
+                alert["recovery_time"] = recovery_time or int(time.time())
+        self._save_json(self.alerts_file, alerts)
+
+        return active_event

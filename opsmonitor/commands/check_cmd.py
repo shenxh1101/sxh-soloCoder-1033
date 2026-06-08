@@ -87,7 +87,7 @@ def check(ctx, targets, group, check_all, group_by, no_group, save_history, show
                 recovery = alert_manager.check_recovery(result, thresholds)
                 if recovery and show_recovery:
                     recoveries.append(recovery)
-                    cm.clear_active_event(target_name)
+                    cm.close_event_on_recovery(target_name, result.timestamp)
     else:
         group_targets = {}
         for target_name in targets_to_check:
@@ -121,7 +121,7 @@ def check(ctx, targets, group, check_all, group_by, no_group, save_history, show
                     recovery = alert_manager.check_recovery(result, thresholds)
                     if recovery and show_recovery:
                         recoveries.append(recovery)
-                        cm.clear_active_event(target_name)
+                        cm.close_event_on_recovery(target_name, result.timestamp)
 
     if new_alerts:
         if not quiet:

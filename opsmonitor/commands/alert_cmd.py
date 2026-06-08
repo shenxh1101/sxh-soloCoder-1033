@@ -289,11 +289,11 @@ def set_threshold(ctx, warning_ms, critical_ms, fail_count, config_dir):
     if warning_ms is not None:
         if warning_ms <= 0:
             raise ValidationError("警告响应时间阈值必须大于 0")
-        params["warning_response_ms"] = warning_ms
+        params["response_time_warning"] = warning_ms
     if critical_ms is not None:
         if critical_ms <= 0:
             raise ValidationError("严重响应时间阈值必须大于 0")
-        params["critical_response_ms"] = critical_ms
+        params["response_time_critical"] = critical_ms
     if fail_count is not None:
         if fail_count <= 0:
             raise ValidationError("连续失败次数阈值必须大于 0")
@@ -306,9 +306,9 @@ def set_threshold(ctx, warning_ms, critical_ms, fail_count, config_dir):
 
     msg_parts = []
     for k, v in params.items():
-        if k == "warning_response_ms":
+        if k == "response_time_warning":
             msg_parts.append(f"警告={v}ms")
-        elif k == "critical_response_ms":
+        elif k == "response_time_critical":
             msg_parts.append(f"严重={v}ms")
         elif k == "consecutive_failures":
             msg_parts.append(f"连续失败={v}次")

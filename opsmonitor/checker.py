@@ -317,6 +317,14 @@ class AlertManager:
             target = result.target
             active_event = self.config_manager.get_active_event(target)
             if active_event:
+                start_time = active_event["start_time"]
+                if isinstance(start_time, str):
+                    try:
+                        from datetime import datetime
+                        dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+                        start_time = int(dt.timestamp())
+                    except ValueError:
+                        start_time = result.timestamp
                 recovery_info = {
                     "target": target,
                     "event_id": active_event["id"],
@@ -324,7 +332,7 @@ class AlertManager:
                     "current_level": result.get_level(thresholds),
                     "response_time": result.response_time,
                     "timestamp": result.timestamp,
-                    "duration_seconds": result.timestamp - active_event["start_time"],
+                    "duration_seconds": result.timestamp - start_time,
                     "alert_count": active_event.get("alert_count", 1)
                 }
                 return recovery_info

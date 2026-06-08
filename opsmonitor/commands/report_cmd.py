@@ -20,7 +20,7 @@ def _calculate_stats(history_entries):
     for entry in history_entries:
         if entry.get("success"):
             success_count += 1
-            rt = entry.get("response_time_ms")
+            rt = entry.get("response_time")
             if rt is not None:
                 success_times.append(rt)
                 if min_time is None or rt < min_time:
@@ -29,7 +29,7 @@ def _calculate_stats(history_entries):
                     max_time = rt
         else:
             failed_count += 1
-            rt = entry.get("response_time_ms")
+            rt = entry.get("response_time")
             if rt is not None:
                 failed_times.append(rt)
 
@@ -184,7 +184,7 @@ def _generate_report_data(cm, hours=24):
         "alerts_count": len(all_alerts),
         "unhandled_alerts_count": sum(1 for a in all_alerts if not a.get("handled")),
         "events_count": len(all_events),
-        "active_events_count": sum(1 for e in all_events if e.get("active")),
+        "active_events_count": sum(1 for e in all_events if not e.get("closed", False)),
         "config": config
     }
 

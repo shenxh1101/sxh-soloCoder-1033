@@ -192,17 +192,33 @@ class OutputFormatter:
         return "\n".join(lines)
 
     def format_alert(self, alert: Dict) -> str:
-        level = alert.get("level", "warning")
+        level = alert.get("last_level", alert.get("level", "warning"))
         icon = self._colorize(Colors.status_icon(level), Colors.level_color(level))
         level_text = self._colorize(level.upper().ljust(8), Colors.level_color(level))
-        time_str = self._format_time(alert.get("timestamp", 0))
+
+        count = alert.get("count", 1)
+        if count > 1:
+            count_str = self._colorize(f" x{count}", Colors.YELLOW)
+        else:
+            count_str = ""
+
+        first_ts = alert.get("first_timestamp", alert.get("timestamp", 0))
+        last_ts = alert.get("last_timestamp", alert.get("timestamp", 0))
+
+        if count > 1:
+            first_str = self._format_time(first_ts)
+            last_str = self._format_time(last_ts)
+            time_str = f"[{first_str} → {last_str}]"
+        else:
+            time_str = f"[{self._format_time(last_ts)}]"
+
         target = self._colorize(alert.get("target", "").ljust(15), Colors.BOLD)
-        message = alert.get("message", "")
+        message = alert.get("last_message", alert.get("message", ""))
         alert_id = alert.get("id", "")[:8]
         handled = "✓" if alert.get("handled", False) else " "
         event_id = alert.get("event_id", "")[:8] if alert.get("event_id") else ""
 
-        line = f"{handled} {icon} {level_text} [{time_str}] {target} {message}"
+        line = f"{handled} {icon} {level_text} {time_str} {target}{count_str} {message}"
 
         if self.quiet:
             return line
@@ -210,8 +226,15 @@ class OutputFormatter:
         if self.verbose:
             lines = [line]
             lines.append(f"    ID: {alert_id}...  事件ID: {event_id}...  类型: {alert.get('type', '')}")
-            if alert.get("response_time"):
-                lines.append(f"    响应时间: {alert['response_time']:.1f}ms")
+            if count > 1:
+                lines.append(f"    累计次数: {count}")
+                lines.append(f"    首次发生: {self._format_time(first_ts)}")
+                lines.append(f"    最后更新: {self._format_time(last_ts)}")
+                if alert.get("first_level") != alert.get("last_level"):
+                    lines.append(f"    级别变化: {alert.get('first_level')} → {alert.get('last_level')}")
+            rt = alert.get("last_response_time", alert.get("response_time"))
+            if rt:
+                lines.append(f"    响应时间: {rt:.1f}ms")
             if alert.get("consecutive_failures"):
                 lines.append(f"    连续失败: {alert['consecutive_failures']} 次")
             if alert.get("handled"):
@@ -226,7 +249,7 @@ class OutputFormatter:
                 lines.append(f"    处理时间: {self._format_time(alert.get('handled_at', 0))}")
             return "\n".join(lines)
 
-        if event_id:
+        if event_id and count == 1:
             line += f" [{event_id}...]"
         return line
 

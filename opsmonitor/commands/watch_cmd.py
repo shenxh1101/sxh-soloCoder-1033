@@ -143,7 +143,7 @@ def watch(ctx, targets, group, watch_all, interval, count, show_alerts, show_rec
                         click.echo()
                         click.echo(formatter.format_recovery(recovery))
                         click.echo()
-                        cm.clear_active_event(target_name)
+                        cm.close_event_on_recovery(target_name, result.timestamp)
 
             check_count += 1
             if count and check_count >= count:
